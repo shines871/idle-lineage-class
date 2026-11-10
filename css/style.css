@@ -1074,7 +1074,8 @@
 #login-title-layer { position:absolute; z-index:3; left:3.1%; top:14%; width:30.8%; color:#f7df91; text-shadow:0 2px 4px #000,0 0 6px #000; container-type:inline-size; }
 /* 🔤 v3.4.22 標題字級改用 cqw（跟隨標題框寬度）而非 vw：修正「寬而矮視窗下框縮小但字仍撐到 vw 上限→標題超框」；並整體略縮 */
 #login-title-layer h1 { margin:0 0 2.5%; font-size:clamp(13px,8cqw,30px); line-height:1.15; color:#f5d46c; }
-#login-update-notes { margin:0; padding-left:1.4em; list-style:decimal; text-align:left; font-size:clamp(8px,3.4cqw,15px); line-height:1.55; color:#f2e6cc; }
+/* 更新說明比標題窄，讓編號與長句都留在底圖金框內。 */
+#login-update-notes { box-sizing:border-box; width:82%; margin:0 auto; padding:0 .25em 0 1.5em; list-style:decimal outside; text-align:left; overflow-wrap:anywhere; font-size:clamp(8px,3.4cqw,15px); line-height:1.55; color:#f2e6cc; }
 #login-update-notes li + li { margin-top:.6em; }
 #main-menu { position:absolute; z-index:4; left:50.4%; top:48.5%; width:25%; margin:0 !important; display:flex; flex-direction:column; align-items:stretch; gap:clamp(10px,1.45vw,22px) !important; }
 #main-menu.hidden { display:none !important; }
@@ -2063,7 +2064,7 @@ button.classic-skill-cell { cursor:pointer; }
     #login-anim-image { left: -28%; top: 70%; width: 142%; height: 30%; object-fit: fill; opacity: .78; }
     #login-title-layer { left: 7%; top: 7%; width: 86%; }
     #login-title-layer h1 { margin-bottom: 8px; font-size: clamp(24px, 7vw, 32px); }
-    #login-update-notes { font-size: 13px; }
+    #login-update-notes { width: 100%; font-size: 13px; }
     #main-menu {
         left: 8%;
         top: 31%;
