@@ -1,5 +1,46 @@
 // ===== ✨ 戰鬥特效層 VFX（cosmetic-only：傷害數字／擊殺粒子／受擊震動。不改任何遊戲數值，全程 try/catch，壞掉也不影響遊戲。__vfxOff=true 可關閉） =====
 let _vfxPending = [];
+// 清場必須同步停止瞬時特效，不能等背景分頁被節流的 timer 自行結束。
+const _vfxCleanups = new Set();
+const _vfxCssEffects = new WeakMap();
+function _vfxTrackCleanup(dispose) {
+    let active = true;
+    let cleanup = () => {
+        if (!active) return;
+        active = false;
+        _vfxCleanups.delete(cleanup);
+        dispose();
+    };
+    _vfxCleanups.add(cleanup);
+    return cleanup;
+}
+function _vfxTimeout(fn, delay) {
+    let timer = null;
+    let cancel = _vfxTrackCleanup(() => clearTimeout(timer));
+    timer = setTimeout(() => {
+        if (!_vfxCleanups.has(cancel)) return;
+        cancel();
+        fn();
+    }, delay);
+    return cancel;
+}
+function _vfxRestartCss(el, className, animationName) {
+    if (!el) return;
+    let effects = _vfxCssEffects.get(el);
+    if (!effects) { effects = Object.create(null); _vfxCssEffects.set(el, effects); }
+    if (effects[className]) effects[className]();
+    let onEnd = event => { if (event.target === el && event.animationName === animationName) cleanup(); };
+    let cleanup = _vfxTrackCleanup(() => {
+        el.removeEventListener('animationend', onEnd);
+        el.classList.remove(className);
+        if (effects[className] === cleanup) delete effects[className];
+    });
+    effects[className] = cleanup;
+    el.classList.remove(className);
+    void el.offsetWidth;
+    el.classList.add(className);
+    el.addEventListener('animationend', onEnd);
+}
 let _vfxLastKillRect = null;   // 最近一次擊殺的怪物格螢幕位置（供稀有掉落閃光定位）
 let _mobRenderCache = null;    // 🚀 怪物列差異更新快取：{ ml節點, structKey, slots:[每格html字串] }→只重建有變動的格子，免每幀整列 innerHTML 重建
 const _VFX_ELE_COLOR = { fire:'#ff7a45', water:'#4fc3f7', wind:'#9ccc65', earth:'#d8a657', magic:'#ce93d8', normal:'#f1f5f9' };
@@ -14,7 +55,16 @@ function _vfxLayer() {
     return l;
 }
 function _vfxClearAll() {   // 🎚️ v3.0.73 換地圖/回城即清空狩獵區殘留特效（死亡殘影 vfx-ghost／法術 vfx-spell／冰凍／怪技能特效）→上一張地圖尚在播放的死亡動畫不會殘留、蓋到村莊或新地圖介面。冰凍/怪技能追蹤 dict 一併清鍵避免孤兒元素。
-    try { let l = document.getElementById('vfx-layer'); if (l) while (l.firstChild) l.removeChild(l.firstChild); } catch (e) {}
+    for (let cleanup of Array.from(_vfxCleanups)) { try { cleanup(); } catch (e) {} }
+    _vfxPending = [];
+    _vfxLastKillRect = null;
+    try {
+        let l = document.getElementById('vfx-layer');
+        if (l) {
+            if (l.getAnimations) for (let animation of l.getAnimations({ subtree: true })) animation.cancel();
+            while (l.firstChild) l.removeChild(l.firstChild);
+        }
+    } catch (e) {}
     try { if (typeof _freezeFx !== 'undefined' && _freezeFx) for (let k in _freezeFx) delete _freezeFx[k]; } catch (e) {}
     try { if (typeof _mobSkillFx !== 'undefined' && _mobSkillFx) for (let k in _mobSkillFx) delete _mobSkillFx[k]; } catch (e) {}
 }
@@ -110,7 +160,7 @@ const SPELL_FX = {
                     byEle: { fire: { prefix: '火' }, water: { prefix: '水' }, earth: { prefix: '地' }, wind: { prefix: '風' } } },
 };
 let _spellFxCache = {};    // dir/prefix → [Image]（預載·避免首播閃爍）
-let _spellFxActive = {};   // fxKey(技能名|目標uid) → true：同目標同特效同時只保留一個（防「一次顯示兩個」）
+let _spellFxActive = {};   // fxKey(技能名|目標uid|施法者) → cleanup：同目標同特效同時只保留一個
 function _preloadFxFrames(dir, prefix, n) {
     let key = dir + '/' + prefix;
     if (_spellFxCache[key]) return _spellFxCache[key];
@@ -153,6 +203,7 @@ function _preloadDeathFx(name, n) {
 //    隱藏時本來就看不見，跳過生成對特效表現零影響；配合檔尾 visibilitychange→_vfxClearAll() 立即釋放已存在的。
 function _vfxMute() { return !!(window.__vfxOff || (typeof document !== 'undefined' && document.hidden) || (typeof state !== 'undefined' && state.ff)); }
 function playSpellFx(skn, mob, caster) {
+    let cleanup = null;
     try {
         if (_vfxMute() || !mob) return;
         let cfg = SPELL_FX[skn]; if (!cfg) return;
@@ -168,6 +219,14 @@ function playSpellFx(skn, mob, caster) {
         let r = box.getBoundingClientRect(); if (r.width === 0 || r.height === 0) return;
         let layer = _vfxLayer();
         if (layer.childElementCount > 220) return;   // 洗版保護
+        let nodes = [], timer = null, frame = null;
+        cleanup = _vfxTrackCleanup(() => {
+            if (timer !== null) clearInterval(timer);
+            if (frame !== null) cancelAnimationFrame(frame);
+            nodes.forEach(el => el.remove());
+            if (_spellFxActive[fxKey] === cleanup) delete _spellFxActive[fxKey];
+        });
+        _spellFxActive[fxKey] = cleanup;
         let _mobImg = box.querySelector('img:not(.mob-anim-shadow):not(.mob-anim-weapon):not(.mob-anim-weapon2)');
         let _anc = _mobImgAnchor(_mobImg);
         let _vc = (cfg.targetVc != null) ? cfg.targetVc : _anc.vc;   // 🌋 地面型特效可指定較低錨點(近腳底)
@@ -214,6 +273,7 @@ function playSpellFx(skn, mob, caster) {
             el.style.width = fxW + 'px'; el.style.height = fxH + 'px'; el.style.left = left; el.style.top = top;
             if (blend) el.style.mixBlendMode = blend;
             layer.appendChild(el);
+            nodes.push(el);
             return el;
         };
         let _applyGeom = (elm) => { if (elm) { elm.style.width = fxW + 'px'; elm.style.height = fxH + 'px'; elm.style.left = left; elm.style.top = top; } };
@@ -229,13 +289,13 @@ function playSpellFx(skn, mob, caster) {
             let el = mkImg(first.src, null, cfg.blend);
             if (_flipX) el.style.transform = 'scaleX(-1)';   // 🎯 4向左側：水平鏡射（NW←NE鏡射·W←E鏡射）
             el.style.left = (ox - fxW * axf) + 'px'; el.style.top = (oy - fxH * ayf) + 'px';   // 立即置於起點(避免首幀閃在終點)
-            _spellFxActive[fxKey] = true;
             let dist = Math.hypot(ax - ox, ay - oy);
             let dur = Math.max(140, Math.min(380, dist / 1600 * 1000));         // 飛行時間依距離(近140ms~遠380ms)
             let frameDur = 1000 / (cfg.fps || 12);
             let _now = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
             let t0 = _now();
             let raf = () => {
+                if (!_vfxCleanups.has(cleanup)) return;
                 try {
                     let elapsed = _now() - t0, t = Math.min(1, elapsed / dur);
                     if (_arFallback && first.naturalWidth && first.naturalHeight) { _arFallback = false; _computeGeom(); }   // 🩹 解碼後校正尺寸(採真原生像素)
@@ -243,11 +303,11 @@ function playSpellFx(skn, mob, caster) {
                     el.style.width = fxW + 'px'; el.style.height = fxH + 'px';
                     el.style.left = (px - fxW * axf) + 'px'; el.style.top = (py - fxH * ayf) + 'px';
                     let fi = Math.floor(elapsed / frameDur) % cfg.n; if (frames[fi]) el.src = frames[fi].src;   // 途中循環幀
-                    if (t < 1) requestAnimationFrame(raf);
-                    else { el.remove(); delete _spellFxActive[fxKey]; }
-                } catch (e) { try { el.remove(); } catch (_) {} delete _spellFxActive[fxKey]; }
+                    if (t < 1) frame = requestAnimationFrame(raf);
+                    else cleanup();
+                } catch (e) { cleanup(); }
             };
-            requestAnimationFrame(raf);
+            frame = requestAnimationFrame(raf);
             return;
         }
         let sEl = shadowFrames ? mkImg(shadowFrames[0].src, 'vfx-spell-shadow', null) : null;   // 🌑 影子層先加(在後·DOM 順序→特效層疊其上)
@@ -256,16 +316,17 @@ function playSpellFx(skn, mob, caster) {
         // 🎇 v2.7.41 多層同步(cfg.layers=額外前綴陣列·同畫布同幾何同幀·如究極光裂術/震裂術 3 spr 同時播)：每層一個 img·全部同 fxW/fxH/left/top/blend·interval 同步推進
         let extraLayers = [];
         if (cfg.layers) for (let lp of cfg.layers) { let lf = _preloadFxFrames(cfg.dir, lp, cfg.n); extraLayers.push({ el: mkImg(lf[0].src, null, cfg.blend), frames: lf }); }
-        _spellFxActive[fxKey] = true;
-        let i = 0, iv = setInterval(() => {
+        let i = 0;
+        timer = setInterval(() => {
+            if (!_vfxCleanups.has(cleanup)) return;
             i++;
-            if (i >= cfg.n) { clearInterval(iv); el.remove(); if (sEl) sEl.remove(); extraLayers.forEach(L => L.el.remove()); delete _spellFxActive[fxKey]; return; }
+            if (i >= cfg.n || !el.isConnected) { cleanup(); return; }
             if (_arFallback && first.naturalWidth && first.naturalHeight) { _arFallback = false; ar = first.naturalWidth / first.naturalHeight; _computeGeom(); _applyGeom(el); if (sEl) _applyGeom(sEl); extraLayers.forEach(L => _applyGeom(L.el)); }   // 🩹 解碼後重算幾何一次(僅首播命中)
             el.src = frames[i].src;
             if (sEl && shadowFrames[i]) sEl.src = shadowFrames[i].src;
             extraLayers.forEach(L => { if (L.frames[i]) L.el.src = L.frames[i].src; });
         }, Math.round(1000 / (cfg.fps || 14)));
-    } catch (e) {}
+    } catch (e) { if (cleanup) cleanup(); }
 }
 // 🙏 v2.7.48 自我增益特效（SELF_FX）：治癒/武器附魔/防禦/屏障等 type buff/heal 技能施放時，於 #battle-view 中央疊播（v3.0.49：玩家變身 sprite 顯示中→改錨定 sprite 身上·否則以戰鬥區為「施法者」錨點）。
 //   掛點＝js/07 castSkill 施放成功且 isSupportSkill(sk)→playSelfFx(sk.n)（未註冊者靜默略過）。cfg：{dir,prefix,n,fps,blend,h=高為戰鬥區高倍數,cx/cy=戰鬥區內錨點比例(預設 0.5/0.62 略偏下=玩家視角)}。
@@ -345,8 +406,9 @@ const SELF_FX = {
     // 🌀 保留：傳送術(手動 teleport 掛點·高瘦光柱)
     '傳送術':       { dir: '傳送術',     prefix: '169-0', n: 7,  fps: 14, blend: 'screen', h: 0.85, cy: 0.55 },
 };
-let _selfFxActive = {};   // 「技能名|錨點識別」 → true：同技能同錨點同時只保留一個
+let _selfFxActive = {};   // 「技能名|錨點識別」 → cleanup：同技能同錨點同時只保留一個
 function playSelfFx(skn, anchorRect) {   // 🩹 v3.0.95 第2參 anchorRect（選用）：顯式錨點 rect（傭兵治癒疊在被治癒者 sprite 身上）·未傳→原邏輯（玩家 sprite→戰鬥區中央）
+    let cleanup = null;
     try {
         if (_vfxMute()) return;
         let cfg = SELF_FX[skn]; if (!cfg) return;
@@ -387,14 +449,21 @@ function playSelfFx(skn, anchorRect) {   // 🩹 v3.0.95 第2參 anchorRect（�
         el.style.width = fxW + 'px'; el.style.height = fxH + 'px'; el.style.left = left; el.style.top = top;
         if (cfg.blend) el.style.mixBlendMode = cfg.blend;
         layer.appendChild(el);
-        _selfFxActive[_fxKey] = true;
-        let i = 0, iv = setInterval(() => {
+        let i = 0, iv = null;
+        cleanup = _vfxTrackCleanup(() => {
+            if (iv !== null) clearInterval(iv);
+            el.remove();
+            if (_selfFxActive[_fxKey] === cleanup) delete _selfFxActive[_fxKey];
+        });
+        _selfFxActive[_fxKey] = cleanup;
+        iv = setInterval(() => {
+            if (!_vfxCleanups.has(cleanup)) return;
             i++;
-            if (i >= cfg.n) { clearInterval(iv); el.remove(); delete _selfFxActive[_fxKey]; return; }
+            if (i >= cfg.n || !el.isConnected) { cleanup(); return; }
             if (_arFallback && first.naturalWidth && first.naturalHeight) { _arFallback = false; ar = first.naturalWidth / first.naturalHeight; _geom(); el.style.width = fxW + 'px'; el.style.height = fxH + 'px'; el.style.left = left; el.style.top = top; }
             el.src = frames[i].src;
         }, Math.round(1000 / (cfg.fps || 14)));
-    } catch (e) {}
+    } catch (e) { if (cleanup) cleanup(); }
 }
 // 🌀 v3.0.102 傳送術特效：於玩家 sprite 身上播 傳送術 光柱，並在特效期間暫時隱藏玩家 sprite（時間到自動恢復）。掛點＝doTeleport / enterHiddenArea（涵蓋 傳送術技能 + 手動/自動 瞬間移動卷軸）。
 let _teleportFxUntil = 0;   // Date.now() 毫秒·此刻之前 _playerMorphApply 隱藏玩家 sprite
@@ -615,7 +684,7 @@ function _vfxNumber(x, y, dmg, ele, big) {
     }
     _vfxLayer().appendChild(el);
     el.addEventListener('animationend', () => el.remove(), { once: true });
-    setTimeout(() => { if (el.parentNode) el.remove(); }, 1400);
+    _vfxTimeout(() => { if (el.parentNode) el.remove(); }, 1400);
 }
 // 🩸 v3.0.103 命中濺血：命中點噴數顆小紅血滴（帶重力弧線→淡出·無殘留貼花·怪物不變色）。爆擊/重擊噴更多。純裝飾·吃 window.__vfxOff。顆粒小、不上 box-shadow 保持不搶眼。
 const _VFX_BLOOD_COLORS = ['#7f1d1d', '#991b1b', '#b91c1c', '#dc2626', '#ef4444'];
@@ -640,7 +709,7 @@ function _vfxBlood(cx, cy, big) {
               { transform: 'translate(calc(-50% + ' + dx.toFixed(1) + 'px), calc(-50% + ' + (up + fall).toFixed(1) + 'px)) scale(.45)', opacity: 0 } ],
             { duration: 360 + Math.random() * 240, easing: 'cubic-bezier(.3,.5,.5,1)' }
         ).onfinish = () => sp.remove();
-        setTimeout(() => { if (sp.parentNode) sp.remove(); }, 680);
+        _vfxTimeout(() => { if (sp.parentNode) sp.remove(); }, 680);
     }
 }
 // 🎯 v2.6.45 怪物圖「視覺中心」偵測：怪物 PNG 多為方形畫布、實體繪於下方(腳貼底·上方透明)→死亡爆裂/傷害數字若錨在方框幾何中心(0.45~0.5)會浮在怪物「上方」。
@@ -724,11 +793,17 @@ function vfxKill(mob) {
                     layer.appendChild(gh);
                     if (_deathSeq) {   // 🎞️ v2.6.86 死亡序列（death_*.png）：殘影原位逐幀播一輪→短淡出（取代白閃；怪卡本體照常移除）
                         _deathGhostCount++;   // 🎬 v3.4.43 專屬節流：生殘影 +1；淡出結束/保險回收擇一 _release() 保證只減一次
-                        let _dghReleased = false;
-                        let _release = () => { if (_dghReleased) return; _dghReleased = true; _deathGhostCount = Math.max(0, _deathGhostCount - 1); };
+                        let _fint = null, _fallback = null, _fades = [], _ghW = [];
+                        let _release = _vfxTrackCleanup(() => {
+                            clearInterval(_fint);
+                            if (_fallback) _fallback();
+                            _fades.forEach(a => a.cancel());
+                            gh.remove();
+                            _ghW.forEach(W => W.el.remove());
+                            _deathGhostCount = Math.max(0, _deathGhostCount - 1);
+                        });
                         gh.src = _deathSeq[0].src;
                         // ⚔️ v2.7.44 死亡殘影武器層(death_w/death_w2·screen 疊上)：與 body death 同鐘逐幀(--multi 共畫布同幾何)·如爆彈花爆炸(僅 death_w)/龍死亡火焰。嚴格 1:1(本幀無 _w 幀→不換 src)。
-                        let _ghW = [];
                         for (let _wk of ['weapon', 'weapon2']) {
                             let _wd = _da[_wk] && _da[_wk].death;
                             if (_wd && _wd.length && _wd[0]) {
@@ -742,25 +817,39 @@ function vfxKill(mob) {
                                 _ghW.push({ el: g2, seq: _wd });
                             }
                         }
-                        let _fi = 0, _fint = setInterval(() => {
+                        let _fi = 0;
+                        _fint = setInterval(() => {
+                            if (!_vfxCleanups.has(_release)) return;
                             _fi++;
                             if (_fi < _deathSeq.length) { gh.src = _deathSeq[_fi].src; _ghW.forEach(W => { if (W.seq[_fi]) W.el.src = W.seq[_fi].src; }); }
-                            else { clearInterval(_fint); try { gh.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 300, easing: 'ease-out' }).onfinish = () => { gh.remove(); _release(); }; } catch (e) { gh.remove(); _release(); } _ghW.forEach(W => { try { W.el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 300, easing: 'ease-out' }).onfinish = () => W.el.remove(); } catch (e) { W.el.remove(); } }); }
+                            else {
+                                clearInterval(_fint);
+                                try {
+                                    for (let el of [gh, ..._ghW.map(W => W.el)]) _fades.push(el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 300, easing: 'ease-out' }));
+                                    _fades[0].onfinish = _release;
+                                } catch (e) { _release(); }
+                            }
                         }, 1000 / MOB_ANIM_FPS);
-                        setTimeout(() => { try { clearInterval(_fint); if (gh.isConnected) gh.remove(); _ghW.forEach(W => { if (W.el.isConnected) W.el.remove(); }); } catch (e) {} _release(); }, _deathSeq.length * (1000 / MOB_ANIM_FPS) + 2000);   // 保險回收
+                        _fallback = _vfxTimeout(_release, _deathSeq.length * (1000 / MOB_ANIM_FPS) + 2000);
                     }   // 🚫 v2.7.49 移除無死亡序列時的 CSS 白閃殘影 else 分支
                 } else if (_img && _img.src && _img.naturalWidth !== 0 && typeof MOB_ANIM_NAMES !== 'undefined' && MOB_ANIM_NAMES.has(mob.n)) {
                     // 🩹 v3.4.49 死亡幀「應有而未就緒」的退場保底：動畫怪的 death 快取還在探測中(換圖後首殺)／八方向怪當前面向尚未載入 → 原本無殘影＝瞬消。
                     //   改用「最後一格可見幀淡出」(~0.4s·無白閃·不違反 v2.7.49 移除靜態白閃的決策——非名單靜態怪照舊)。計入 _deathGhostCount 同一節流。
                     _deathGhostCount++;
-                    let _fgDone = false; let _fgRelease = () => { if (_fgDone) return; _fgDone = true; _deathGhostCount = Math.max(0, _deathGhostCount - 1); };
                     let gh2 = document.createElement('img'); gh2.className = 'vfx-ghost'; gh2.src = _img.src;
+                    let _fgFade = null, _fgTimer = null;
+                    let _fgRelease = _vfxTrackCleanup(() => {
+                        if (_fgTimer) _fgTimer();
+                        if (_fgFade) _fgFade.cancel();
+                        gh2.remove();
+                        _deathGhostCount = Math.max(0, _deathGhostCount - 1);
+                    });
                     let _ir2 = _img.getBoundingClientRect();
                     gh2.style.left = (_ir2.width > 0 ? (_ir2.left + _ir2.width / 2) : bcx) + 'px'; gh2.style.top = (_ir2.width > 0 ? (_ir2.top + _ir2.height / 2) : bcy) + 'px';
                     gh2.style.width = (_ir2.width > 0 ? _ir2.width : r.width) + 'px'; gh2.style.height = (_ir2.width > 0 ? _ir2.height : r.height) + 'px';
                     layer.appendChild(gh2);
-                    try { gh2.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 400, easing: 'ease-out' }).onfinish = () => { gh2.remove(); _fgRelease(); }; } catch (e) { gh2.remove(); _fgRelease(); }
-                    setTimeout(() => { try { if (gh2.isConnected) gh2.remove(); } catch (e) {} _fgRelease(); }, 900);   // 保險回收
+                    _fgTimer = _vfxTimeout(_fgRelease, 900);
+                    try { _fgFade = gh2.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 400, easing: 'ease-out' }); _fgFade.onfinish = _fgRelease; } catch (e) { _fgRelease(); }
                 }
             } catch (e) {}
             // 🧊 v2.7.46 死亡多重特效：death_effect anchored 疊層(獨立時間軸·可比 body death 長·如冰之女王碎裂 body5幀/effect25幀)。錨定同 skill_effect：殘影錨在 box rect·offset×scale·screen 加亮。
@@ -774,12 +863,20 @@ function vfxKill(mob) {
                     de.style.width = (_dfCfg.ew * _dsx) + 'px'; de.style.height = (_dfCfg.eh * _dsy) + 'px';
                     de.style.left = (r.left + _dfCfg.anchored.ox * _dsx) + 'px'; de.style.top = (r.top + _dfCfg.anchored.oy * _dsy) + 'px';
                     layer.appendChild(de);
-                    let _dfi = 0, _dfint = setInterval(() => {
+                    let _dfi = 0, _dfint = null, _dfTimer = null, _dfFade = null;
+                    let _dfRelease = _vfxTrackCleanup(() => {
+                        clearInterval(_dfint);
+                        if (_dfTimer) _dfTimer();
+                        if (_dfFade) _dfFade.cancel();
+                        de.remove();
+                    });
+                    _dfint = setInterval(() => {
+                        if (!_vfxCleanups.has(_dfRelease)) return;
                         _dfi++;
                         if (_dfi < _dfCfg.n) { if (_dfF[_dfi]) de.src = _dfF[_dfi].src; }
-                        else { clearInterval(_dfint); try { de.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 280, easing: 'ease-out' }).onfinish = () => de.remove(); } catch (e) { de.remove(); } }
+                        else { clearInterval(_dfint); try { _dfFade = de.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 280, easing: 'ease-out' }); _dfFade.onfinish = _dfRelease; } catch (e) { _dfRelease(); } }
                     }, 1000 / MOB_ANIM_FPS);
-                    setTimeout(() => { try { clearInterval(_dfint); if (de.isConnected) de.remove(); } catch (e) {} }, _dfCfg.n * (1000 / MOB_ANIM_FPS) + 2000);   // 保險回收
+                    _dfTimer = _vfxTimeout(_dfRelease, _dfCfg.n * (1000 / MOB_ANIM_FPS) + 2000);
                 }
             } catch (e) {}
             // 🚫 v2.7.49 此死亡路徑不再畫衝擊波環(vfx-killring)/核心爆閃(vfx-particle)——只保留死亡序列幀 anim
@@ -793,7 +890,7 @@ function vfxKill(mob) {
                 fl.style.left = br.left + 'px'; fl.style.top = br.top + 'px'; fl.style.width = br.width + 'px'; fl.style.height = br.height + 'px';
                 fl.style.background = 'radial-gradient(circle, rgba(255,255,255,.6), rgba(255,213,79,.25) 45%, rgba(255,213,79,0) 75%)';
                 fl.style.animation = 'vfxBossFlash .7s ease-out forwards';
-                layer.appendChild(fl); fl.addEventListener('animationend', () => fl.remove(), { once: true }); setTimeout(() => { if (fl.parentNode) fl.remove(); }, 1200);
+                layer.appendChild(fl); fl.addEventListener('animationend', () => fl.remove(), { once: true }); _vfxTimeout(() => { if (fl.parentNode) fl.remove(); }, 1200);
             }
         }
     } catch (e) {}
@@ -814,20 +911,20 @@ function vfxLevelUp() {
             fl.style.left = br.left + 'px'; fl.style.top = br.top + 'px'; fl.style.width = br.width + 'px'; fl.style.height = br.height + 'px';
             fl.style.background = 'radial-gradient(circle, rgba(255,213,79,.42), rgba(255,213,79,0) 70%)';
             fl.style.animation = 'vfxLvFlash .9s ease-out forwards';
-            layer.appendChild(fl); fl.addEventListener('animationend', () => fl.remove(), { once: true }); setTimeout(() => { if (fl.parentNode) fl.remove(); }, 1500);
+            layer.appendChild(fl); fl.addEventListener('animationend', () => fl.remove(), { once: true }); _vfxTimeout(() => { if (fl.parentNode) fl.remove(); }, 1500);
         }
         for (let i = 0; i < 2; i++) {
             let ring = document.createElement('div'); ring.className = 'vfx-lvring';
             let sz = 90 + i * 44;
             ring.style.left = cx + 'px'; ring.style.top = cy + 'px'; ring.style.width = sz + 'px'; ring.style.height = sz + 'px';
             ring.style.animation = 'vfxLvRing ' + (0.7 + i * 0.15) + 's ease-out forwards';
-            layer.appendChild(ring); ring.addEventListener('animationend', () => ring.remove(), { once: true }); setTimeout(() => { if (ring.parentNode) ring.remove(); }, 1500);
+            layer.appendChild(ring); ring.addEventListener('animationend', () => ring.remove(), { once: true }); _vfxTimeout(() => { if (ring.parentNode) ring.remove(); }, 1500);
         }
         let t = document.createElement('div'); t.className = 'vfx-lvtext';
         t.style.left = cx + 'px'; t.style.top = cy + 'px'; t.style.fontSize = '26px';
         t.textContent = 'LEVEL UP!  Lv.' + player.lv;
         t.style.animation = 'vfxLvText 1.5s ease-out forwards';
-        layer.appendChild(t); t.addEventListener('animationend', () => t.remove(), { once: true }); setTimeout(() => { if (t.parentNode) t.remove(); }, 2200);
+        layer.appendChild(t); t.addEventListener('animationend', () => t.remove(), { once: true }); _vfxTimeout(() => { if (t.parentNode) t.remove(); }, 2200);
         let n = 18;
         for (let i = 0; i < n; i++) {
             let sp = document.createElement('div'); sp.className = 'vfx-particle';
@@ -954,7 +1051,7 @@ function playArrowFx(who, target, delayMs) {
                 { duration: ARROW_FX_MS, easing: 'cubic-bezier(.35,.05,.6,1)' }
             ).onfinish = () => el.remove();
         };
-        if (delayMs > 0) setTimeout(fire, delayMs); else fire();
+        if (delayMs > 0) _vfxTimeout(fire, delayMs); else fire();
     } catch (e) {}
 }
 // 稀有掉落（潘朵拉權重=1）：金色名稱上升 + 金色星芒火花，定位於剛擊殺的怪物格
@@ -970,7 +1067,7 @@ function vfxRareDrop(name) {
         t.style.left = cx + 'px'; t.style.top = cy + 'px'; t.style.fontSize = '20px'; t.style.color = '#ffe08a';
         t.textContent = '✦ ' + (name || '稀有掉落') + ' ✦';
         t.style.animation = 'vfxLvText 1.6s ease-out forwards';
-        layer.appendChild(t); t.addEventListener('animationend', () => t.remove(), { once: true }); setTimeout(() => { if (t.parentNode) t.remove(); }, 2300);
+        layer.appendChild(t); t.addEventListener('animationend', () => t.remove(), { once: true }); _vfxTimeout(() => { if (t.parentNode) t.remove(); }, 2300);
         let n = 16;
         for (let i = 0; i < n; i++) {
             let sp = document.createElement('div'); sp.className = 'vfx-particle';
@@ -990,9 +1087,9 @@ function vfxPlayerHit(dmg) {
         let frac = (player && player.mhp) ? dmg / player.mhp : 0;
         if (frac < 0.10) return;   // 只在 ≥10% 最大HP 的一擊才震，避免每下都晃
         let bv = document.getElementById('battle-view');
-        if (bv) { bv.classList.remove('vfx-shake'); void bv.offsetWidth; bv.classList.add('vfx-shake'); bv.addEventListener('animationend', () => bv.classList.remove('vfx-shake'), { once: true }); }
+        _vfxRestartCss(bv, 'vfx-shake', 'vfxShake');
         let bar = document.getElementById('bar-hp'); bar = bar && bar.parentElement;
-        if (bar) { bar.classList.remove('vfx-hurt'); void bar.offsetWidth; bar.classList.add('vfx-hurt'); bar.addEventListener('animationend', () => bar.classList.remove('vfx-hurt'), { once: true }); }
+        _vfxRestartCss(bar, 'vfx-hurt', 'vfxHurt');
     } catch (e) {}
 }
 // 🗡️ 怪物施法震動（死亡騎士施法時整個戰場輕微震動·cosmetic-only·吃 __vfxOff·重用 vfx-shake 動畫）
@@ -1000,7 +1097,7 @@ function vfxCastShake() {
     try {
         if (_vfxMute()) return;
         let bv = document.getElementById('battle-view');
-        if (bv) { bv.classList.remove('vfx-shake'); void bv.offsetWidth; bv.classList.add('vfx-shake'); bv.addEventListener('animationend', () => bv.classList.remove('vfx-shake'), { once: true }); }
+        _vfxRestartCss(bv, 'vfx-shake', 'vfxShake');
     } catch (e) {}
 }
 
@@ -1057,8 +1154,7 @@ function vfxBossEntrance(mob, opts) {
         let boxCss = 'position:absolute;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;pointer-events:none;border-radius:6px;';
 
         // 1) 強力螢幕震動（#battle-view·rect 已於震動前讀取→overlay 停靜止位）
-        bv.classList.remove('vfx-bossshake'); void bv.offsetWidth; bv.classList.add('vfx-bossshake');
-        bv.addEventListener('animationend', () => bv.classList.remove('vfx-bossshake'), { once: true });
+        _vfxRestartCss(bv, 'vfx-bossshake', 'vfxBossShake');
 
         // 2) 全屏屬性染色閃光（screen 加亮·自中心爆閃淡出）
         let flash = document.createElement('div');
@@ -1104,7 +1200,7 @@ function vfxBossEntrance(mob, opts) {
 
 // 🔥 v3.4.15 頭目狂暴爆發：沿用「頭目降臨」的戰場名條語言，改成猩紅閃光、衝擊環與火星。
 //   此函式只負責一次性視覺；持續氣焰由 .mob-raging CSS 控制，提示／進出狂暴狀態由 renderMobs 的轉場偵測負責。
-let _bossRageLast = {};
+let _bossRageLast = new WeakMap();   // 怪物離場後不保留每次重生的 uid。
 function vfxBossRage(mob) {
     try {
         if (!mob || window.__vfxOff) return;
@@ -1112,8 +1208,8 @@ function vfxBossRage(mob) {
         let cfg = BOSS_ENTRANCE_FX[mob.n];
         if (!cfg || !(Number(mob.rageHpPct) > 0)) return;
         let now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-        if (_bossRageLast[mob.uid] && now - _bossRageLast[mob.uid] < 1200) return;
-        _bossRageLast[mob.uid] = now;
+        if (_bossRageLast.has(mob) && now - _bossRageLast.get(mob) < 1200) return;
+        _bossRageLast.set(mob, now);
         let bv = document.getElementById('battle-view');
         if (!bv || bv.classList.contains('hidden')) return;
         let r = bv.getBoundingClientRect();
@@ -1123,8 +1219,7 @@ function vfxBossRage(mob) {
         let boxCss = 'position:absolute;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;pointer-events:none;border-radius:6px;';
         let a = '#fb3b45', b = '#7f1018';
 
-        bv.classList.remove('vfx-bossshake'); void bv.offsetWidth; bv.classList.add('vfx-bossshake');
-        bv.addEventListener('animationend', () => bv.classList.remove('vfx-bossshake'), { once: true });
+        _vfxRestartCss(bv, 'vfx-bossshake', 'vfxBossShake');
 
         let flash = document.createElement('div');
         flash.style.cssText = boxCss + 'mix-blend-mode:screen;background:radial-gradient(circle at 50% 55%, #fff1a8 0%, ' + a + 'cc 15%, ' + b + '99 42%, transparent 73%);';
@@ -2463,7 +2558,7 @@ setInterval(() => { if (!document.hidden && !(typeof catchupActive === 'function
 // 🌙 v3.6.03 掛網記憶體釋放：切到背景的瞬間清空 #vfx-layer 全部特效元素＋冰凍/怪技能追蹤 dict。
 //    背景分頁的移除管線全數停擺（animationend 不觸發·WAAPI onfinish 暫停·setTimeout 節流至 1/分鐘），
 //    放著只會讓 Chrome 抱著幾百個動畫節點；隱藏時本來就看不見→立即釋放對特效表現零影響。
-//    殘留的幀步進 interval／保險回收 timer 都有 isConnected／dict 空鍵守衛，外部清空後會安全自我了結。
+//    幀步進 interval、延遲箭矢、保險回收 timer 與震動監聽器同步取消，去重鍵也立即釋放。
 //    回前景不需特殊處理：_vfxMute() 已含 document.hidden，新特效自然恢復生成。
 document.addEventListener('visibilitychange', () => { if (document.hidden) { try { _vfxClearAll(); } catch (e) {} try { _vfxPending = []; } catch (e) {} } });
 

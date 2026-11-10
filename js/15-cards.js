@@ -222,11 +222,15 @@ function _cardDropRoll(name, tier, rate, pool) {
 
 // ---- 使用卡片（useItem 分派）：加積分登錄；持有多張同卡 → 自動全部使用至滿100分即止；已開通則無法使用 ----
 function useCardItem(item) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => useCardItem(item));
+    // 等候跨視窗存檔鎖期間，前一次操作可能已用掉這張卡；只接受仍在背包內的實體。
+    item = item && player.inv.find(i => i.uid === item.uid && i.id === item.id);
+    if (!item) return;
     let d = DB.items[item.id]; if (!d || !d.cardMob) return;
     let nm = d.cardMob, tier = d.cardTier, ct = CARD_TIERS[tier - 1];
     if (cardDexScore(nm) >= 100) {   // 🎴 圖鑑已開通(滿100分)：無法使用
         logSys(`<span class="${ct.col} font-bold">「${nm}」</span><span class="text-slate-400"> 的圖鑑已開通，無法使用。</span>`);
-        if (typeof closeModal === 'function') closeModal();
+        if (typeof closeModal === 'function' && !_deferItemTransactionEffect(closeModal, [])) closeModal();
         return;
     }
     // 🎴 自動全部使用：用到滿100分即止（多餘留在背包）；開通溢出退費 → 由 _cardRegister 單一真相處理（同 acquireCard）。
@@ -240,7 +244,7 @@ function useCardItem(item) {
     if (typeof updateUI === 'function') updateUI();
     if (typeof saveGame === 'function') saveGame();
     if (_cardBookOpen) renderCardBook();
-    if (typeof closeModal === 'function') closeModal();
+    if (typeof closeModal === 'function' && !_deferItemTransactionEffect(closeModal, [])) closeModal();
 }
 
 // ---- recomputeStats 鉤子：套用各地區「完成」加成（只取該區最高已達階；金=普+銀）----
@@ -304,6 +308,7 @@ function _cardSynthPlan() {   // 純計算預覽（不改狀態）：回 {2:銀�
     return { 2: g2.made, 3: g3.made };
 }
 function magicDollSynth() {   // 一鍵合成：先普→銀(任意湊10·輸出多者)，再銀→金(新銀卡一起參與連鎖)。無 RNG＝決定論
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => magicDollSynth());
     let made = { 2: 0, 3: 0 };
     for (let ft = 1; ft <= 2; ft++) {   // 兩階段各自重掃 inv：銀卡那輪會掃到上一輪剛 gainItem 的銀卡（連鎖）
         let counts = _cardCountsByTier(ft);
@@ -356,6 +361,7 @@ function _dollBoxOutcome(seq) {
 
 // 開啟魔法娃娃的袋子（all=true 一次開完所有）：每袋消耗 1 個 dollSeq → save/load 後 seq 已存、結果固定不可重抽
 function openDollBag(item, all) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => openDollBag(item, all));
     let bag = player.inv.find(i => i.id === 'doll_bag');
     if (!bag) { logSys('<span class="text-slate-400">沒有魔法娃娃的袋子可開。</span>'); return; }
     bag.cnt = bag.cnt || 1;
@@ -381,6 +387,7 @@ function openDollBag(item, all) {
 
 // 🎁 開啟高級魔法娃娃的盒子（all=true 一次開完）：committed RNG（dollSeq），save/load 後結果固定不可重抽
 function openDollBox(item, all) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => openDollBox(item, all));
     let box = player.inv.find(i => i.id === 'doll_box_high');
     if (!box) { logSys('<span class="text-slate-400">沒有高級魔法娃娃的盒子可開。</span>'); return; }
     box.cnt = box.cnt || 1;
@@ -410,7 +417,15 @@ function dollExcessGoldCards() { return player.inv.filter(it => { let d = DB.ite
 function dollExcessGoldCount() { return dollExcessGoldCards().reduce((s, it) => s + (it.cnt || 1), 0) + _dollWhExcessCount(3); }   // 🔧 含倉庫多餘金卡
 // 🔧 倉庫「多餘卡片」支援（僅圖鑑已開金階的重複卡）：兌換娃娃袋子/盒子時，背包不足自動動用倉庫存量（背包優先）。走 load→save 成對、吃倉庫安全網（拒寫失敗檔＋多分頁 uid 合併）。⚠️ 僅「兌換」用；卡片/娃娃「合成」仍只讀背包（見 magicDollSynth／dollSynth 不變量）。
 function _dollWhExcessCount(tier) {
-    try { return loadWarehouse().items.filter(it => { let d = DB.items[it.id]; return d && !it.lock && d.eff === 'card' && d.cardTier === tier && cardDexTier(d.cardMob) >= 3; }).reduce((s, it) => s + (it.cnt || 1), 0); } catch (e) { return 0; }
+    try {
+        let w = loadWarehouse();
+        if (_itemTransaction && typeof _whLoadOk !== 'undefined' && !_whLoadOk)
+            _itemTransactionAbort('倉庫卡片無法讀取，兌換已取消。');
+        return w.items.filter(it => { let d = DB.items[it.id]; return d && !it.lock && d.eff === 'card' && d.cardTier === tier && cardDexTier(d.cardMob) >= 3; }).reduce((s, it) => s + (it.cnt || 1), 0);
+    } catch (e) {
+        if (_itemTransaction) _itemTransactionAbort('倉庫卡片無法讀取，兌換已取消。');
+        return 0;
+    }
 }
 function _dollWhExcessConsume(tier, n) {   // 自倉庫扣除最多 n 張符合條件的卡；回傳實扣數（只動被消耗的堆疊、不碰其餘，避免誤刪無 cnt 項）
     if (n <= 0) return 0;
@@ -423,17 +438,22 @@ function _dollWhExcessConsume(tier, n) {   // 自倉庫扣除最多 n 張符合�
             if (take >= c) w.items.splice(i, 1); else it.cnt = c - take;
             need -= take; changed = true;
         }
-        if (changed) saveWarehouse(w);
+        if (changed && !saveWarehouse(w)) _itemTransactionAbort('倉庫卡片未能安全儲存，兌換已取消。');
         return n - need;
-    } catch (e) { return 0; }
+    } catch (e) {
+        if (_itemTransaction) _itemTransactionAbort('倉庫卡片未能安全扣除，兌換已取消。');
+        return 0;
+    }
 }
 // 通用兌換：把多餘卡片(pool)依數量扣除 n 張，發 n 個 rewardId（不足整疊則部分扣）
 function _dollCardExchange(pool, n, rewardId, whTier) {
+    n = Number(n);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) _itemTransactionAbort('卡片兌換數量不正確。');
     let need = n, rm = [];
     for (let it of pool) { if (need <= 0) break; let c = it.cnt || 1; if (c <= need) { need -= c; rm.push(it.uid); } else { it.cnt = c - need; need = 0; } }
     if (rm.length) player.inv = player.inv.filter(i => rm.indexOf(i.uid) === -1);
-    let got = (n - need) + ((need > 0 && whTier) ? _dollWhExcessConsume(whTier, need) : 0);   // 🔧 背包優先，不足再扣倉庫；只發「實際消耗」的張數（多分頁下倉庫可能已變動→不超發）
-    if (got <= 0) return 0;
+    let got = (n - need) + ((need > 0 && whTier) ? _dollWhExcessConsume(whTier, need) : 0);   // 背包優先、不足再扣倉庫；必須完整扣齊本次數量才發獎。
+    if (got !== n) _itemTransactionAbort('卡片數量已變動，兌換已取消；請重新操作。');
     gainItem(rewardId, got, true, true);
     if (typeof renderTabs === 'function') renderTabs(true);
     if (typeof updateUI === 'function') updateUI();
@@ -443,6 +463,7 @@ function _dollCardExchange(pool, n, rewardId, whTier) {
 }
 // 用多餘銀卡兌換娃娃袋子（1 銀卡 = 1 袋；all=true 全換）
 function exchangeSilverForBags(all) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => exchangeSilverForBags(all));
     let pool = dollExcessSilverCards();
     let total = pool.reduce((s, it) => s + (it.cnt || 1), 0) + _dollWhExcessCount(2);   // 🔧 含倉庫多餘銀卡
     if (total <= 0) { logSys('<span class="text-slate-400">沒有可兌換的多餘銀卡（需「圖鑑已開金階」的重複銀卡）。</span>'); return; }
@@ -452,6 +473,7 @@ function exchangeSilverForBags(all) {
 }
 // 用多餘金卡兌換高級魔法娃娃的盒子（1 金卡 = 1 盒；all=true 全換）
 function exchangeGoldForBoxes(all) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => exchangeGoldForBoxes(all));
     let pool = dollExcessGoldCards();
     let total = pool.reduce((s, it) => s + (it.cnt || 1), 0) + _dollWhExcessCount(3);   // 🔧 含倉庫多餘金卡
     if (total <= 0) { logSys('<span class="text-slate-400">沒有可兌換的多餘金卡（需「圖鑑已開金階」的重複金卡）。</span>'); return; }
@@ -510,6 +532,7 @@ function _dollGrantBatchCounts(map) {
 //   只有「放 4 個」失敗才累積 1 點保底（per-tier 分開）；保底達 5 時下次 4 個合成必定成功並清空。committed RNG。
 //   ⚠️不變量：合成只讀寫「背包 player.inv」，絕不碰共用倉庫(loadWarehouse w.items)——存進倉庫的娃娃不計入也不會被消耗。dollTierCount 同。新增取料路徑勿改讀倉庫。
 function dollSynth(fromTier, count) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => dollSynth(fromTier, count));
     fromTier = +fromTier; count = +count;
     if (!DOLL_SYNTH_RATES[fromTier] || !DOLL_SYNTH_RATES[fromTier][count]) { logSys('<span class="text-red-400">無效的合成設定。</span>'); return; }
     if (dollTierCount(fromTier) < count) { logSys(`<span class="text-red-400 font-bold">第 ${fromTier} 階魔法娃娃不足 ${count} 個。</span>`); return; }
@@ -546,6 +569,7 @@ function dollSynth(fromTier, count) {
     _dollAfterChange();
 }
 function dollSynthAll(fromTier, count) {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => dollSynthAll(fromTier, count));
     fromTier = +fromTier; count = +count;
     if (!DOLL_SYNTH_RATES[fromTier] || !DOLL_SYNTH_RATES[fromTier][count]) { logSys('<span class="text-red-400">無效的合成設定。</span>'); return; }
     let snapshot = _dollBatchSnapshot(fromTier, count);
@@ -590,6 +614,7 @@ function dollSynthAll(fromTier, count) {
 // 🔄 6 階重組：消耗 2 個（未鎖定）第 6 階娃娃 → 必得 1 個「與這 2 個材料皆不同」的第 6 階娃娃（現有 4 隻六階互換）。
 //   committed RNG（dollSeq·save/load 不變）；100% 成功（2→1 已是代價，不再賭機率）；⚠️同 dollSynth 只讀寫背包、不碰倉庫。
 function dollRerollT6() {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => dollRerollT6());
     if (dollTierCount(6) < 2) { logSys('<span class="text-red-400 font-bold">第 6 階魔法娃娃不足 2 個（未鎖定）。</span>'); return; }
     let consumed = [], need = 2;
     for (let it of player.inv) {   // 依背包順序取 2 個未鎖定六階（鎖定的受保護不消耗）；記錄 id 供「排除材料」
@@ -611,6 +636,7 @@ function dollRerollT6() {
     _dollAfterChange();
 }
 function dollRerollT6All() {
+    if (!_itemTransaction) return runItemTransaction('卡片／娃娃操作', () => dollRerollT6All());
     let snapshot = _dollBatchSnapshot(6, 2);
     if (!snapshot.groups.length) { logSys('<span class="text-red-400 font-bold">第 6 階魔法娃娃不足 2 個（未鎖定）。</span>'); return; }
     let sum = { type: 'reroll', tries: 0, made: {} };
@@ -637,6 +663,7 @@ function setDollSynthTier(t) { _dollSynthTier = +t; let _c = document.getElement
 function setDollSynthCount(n) { _dollSynthCount = +n; let _c = document.getElementById('interaction-content'); if (_c) renderCardSynth(_c); }
 
 function renderCardSynth(div) {
+    if (_deferItemTransactionEffect(renderCardSynth, arguments)) return;
     let made = _cardSynthPlan();
     let can = (made[2] + made[3]) > 0;
     let h = `<div class="p-4 text-slate-300 leading-relaxed">魔法娃娃商人：把重複的卡片交給我吧。<br>
@@ -759,6 +786,7 @@ function _codexMobThumbHtml(nm, mi, silh) {
 }
 
 function renderCardBook() {
+    if (_deferItemTransactionEffect(renderCardBook, arguments)) return;
     let host = document.getElementById('card-book-body'); if (!host) return;
     // 分頁列
     let tabHost = document.getElementById('card-book-tabs');

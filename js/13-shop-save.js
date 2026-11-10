@@ -484,6 +484,102 @@ function portablePetRoster(list){
 }
 // 匯出：先儲存當前進度，再把該角色存檔寫成 .json 檔。優先用檔案系統 API（可自選資料夾），
 //       不支援時退回瀏覽器下載（落在預設下載資料夾）。
+// Validate the fields used before loadGame can apply legacy defaults.
+// Optional migration fields and unknown item/map IDs remain compatible.
+function _validatePortableSave(d) {
+    let record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    let fail = field => { throw new Error('存檔資料格式不正確：' + field); };
+    if (!record(d) || !record(d.p) || !record(d.ms)) fail('角色或地圖');
+    if (d.v != null && (!Number.isInteger(d.v) || d.v < 1 || d.v > SAVE_VERSION)) fail('不支援的存檔版本');
+    if (d.ticks != null && (!Number.isFinite(d.ticks) || d.ticks < 0)) fail('時間');
+    let p = d.p;
+    if (!['royal', 'knight', 'elf', 'mage', 'dark', 'dragon', 'warrior', 'illusion'].includes(p.cls)) fail('職業');
+    if (!record(p.base) || !record(p.d) || !record(p.eq)) fail('能力或裝備');
+    for (let key of ['str', 'dex', 'con', 'int', 'wis']) {
+        if (!Number.isFinite(p.base[key])) fail('基本能力 ' + key);
+    }
+    if (p.base.cha != null && !Number.isFinite(p.base.cha)) fail('基本能力 cha');
+    for (let key of ['lv', 'exp', 'gold']) {
+        if (p[key] != null && !Number.isFinite(p[key])) fail(key);
+    }
+    let item = value => record(value) && typeof value.id === 'string' && value.id.length > 0
+        && (value.cnt === undefined || (Number.isInteger(value.cnt) && value.cnt > 0));
+    if (!Array.isArray(p.inv) || !p.inv.every(item)) fail('背包');
+    if (!Object.values(p.eq).every(value => value == null || item(value))) fail('裝備物品');
+    if (!Array.isArray(p.skills) || !p.skills.every(value => typeof value === 'string')) fail('技能');
+    // These containers may be absent in old saves, but a present scalar/array cannot
+    // safely pass the migrations that precede applySaveDefaults.
+    for (let key of ['alloc', 'panacea', 'cds', 'buffs', 'statuses', 'siege', 'config',
+        'junkPrefs', 'cardDex', 'equipDex', 'miscDex', 'relicDex', 'summon', 'charmed']) {
+        if (p[key] != null && !record(p[key])) fail(key);
+    }
+    if (p.allies != null && (!Array.isArray(p.allies)
+        || !p.allies.every(value => value == null || record(value)))) fail('傭兵');
+    if (d.ms.mobs != null && (!Array.isArray(d.ms.mobs)
+        || !d.ms.mobs.every(value => value == null || record(value)))) fail('怪物');
+}
+
+// Merge shared collection progress into the parsed export copy, never live player.
+// Read the selected role's mode explicitly; the currently playing role may differ.
+function _mergePortableCollections(p) {
+    let record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    let read = base => {
+        let raw = _lzGetStrict(_dexKey(base, p));
+        if (raw == null) return {};
+        let value = JSON.parse(raw);
+        if (!record(value)) throw new Error('共用圖鑑資料格式不正確：' + base);
+        return value;
+    };
+    let sharedCard = read(CARDDEX_KEY), ownCard = p.cardDex || {};
+    if (!record(ownCard)) throw new Error('角色卡片圖鑑資料格式不正確');
+    let cards = Object.create(null);
+    let mergeCard = (source, old) => {
+        for (let key of Object.keys(source)) {
+            if (key === '_v') continue;
+            let value = source[key];
+            if (!Number.isFinite(value) || value < 0) throw new Error('卡片圖鑑積分不正確');
+            let score = old ? cardTierToScore(value) : value;
+            cards[key] = Math.max(cards[key] || 0, score);
+        }
+    };
+    mergeCard(sharedCard, sharedCard._v !== 2);
+    mergeCard(ownCard, p.cardDexV !== 2);
+    p.cardDex = cards;
+    p.cardDexV = 2;
+    for (let [base, field] of [[EQUIPDEX_KEY, 'equipDex'], [MISCDEX_KEY, 'miscDex'], [RELICDEX_KEY, 'relicDex']]) {
+        let shared = read(base), own = p[field] || {};
+        if (!record(own)) throw new Error('角色圖鑑資料格式不正確：' + field);
+        let combined = Object.create(null);
+        for (let source of [shared, own]) {
+            for (let key of Object.keys(source)) if (source[key]) combined[key] = true;
+        }
+        p[field] = combined;
+    }
+}
+
+function _readTransferObject(key) {
+    let raw = _lzGetStrict(key);
+    if (raw == null) return null;
+    let unwrapped = _saveUnwrap(raw);
+    if (!unwrapped.ok) throw new Error('Stored signature is invalid: ' + key);
+    let value = JSON.parse(unwrapped.payload);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Stored object is invalid: ' + key);
+    return value;
+}
+function _restoreImportSnapshots(before) {
+    let restore = entry => {
+        try {
+            if (_lsGetStrict(entry.key) === entry.raw) return true;
+            if (entry.raw == null) _lzRemoveStored(entry.key);
+            else _lzSetStoredRaw(entry.key, entry.raw);
+            return _lsGetStrict(entry.key) === entry.raw;
+        } catch (e) { return false; }
+    };
+    let failed = [];
+    for (let i = before.length - 1; i >= 0; i--) if (!restore(before[i])) failed.push(before[i]);
+    // 刪除本輪新鍵後空間可能已釋出，僅對失敗項再試一次並驗證結果。
+    return failed.map(restore).every(Boolean);
+}
 async function exportSave(slot){
     let slotNo = Math.max(1, Math.floor(Number(slot || currentSlot) || 1));
     if (slotNo === currentSlot && player && player.cls) {
@@ -491,28 +587,31 @@ async function exportSave(slot){
         try { saved = saveGame() === true; } catch(e){}
         if(!saved){ alert('匯出已取消：目前角色或寵物資料未能成功儲存，請先排除儲存空間問題。'); return; }
     }
-    let stored = _saveUnwrap(_lzGet('lineage_idle_save_' + slotNo));
+    let stored;
+    try { stored = _saveUnwrap(_lzGetStrict('lineage_idle_save_' + slotNo)); }
+    catch(e){ alert('匯出失敗：角色存檔無法完整讀取，未產生匯出檔。'); return; }
     if(stored.signed && !stored.ok){ alert('匯出失敗：角色存檔完整性校驗未通過。'); return; }
     let data = stored.payload;   // 💾 解壓並解簽 → 取出明文 JSON payload
     if(!data){ alert('目前沒有可匯出的存檔。'); return; }
     // 🔧 一併收錄共用倉庫（依角色的經典/非經典模式取對應倉庫）；匯入時可選擇是否還原
     try {
         let _obj = JSON.parse(data);
-        if(!_obj || typeof _obj !== 'object' || !_obj.p || typeof _obj.p !== 'object') throw new Error('invalid player save');
+        _validatePortableSave(_obj);
         let _p = _obj.p;
+        _mergePortableCollections(_p);
         // 🐉 傭兵通關日記在角色外部小鍵，匯出任意存檔位時同步回角色欄位，確保跨機匯入後仍保留今日次數。
         if(typeof antharasRoleRef === 'function' && typeof antharasRoleClearDay === 'function'){
             let _antRef = antharasRoleRef(_p, slotNo);
             if(_antRef) _p.antharasClearDay = Math.max(Number(_p.antharasClearDay) || 0, antharasRoleClearDay(_antRef));
         }
         _obj.p.allies = [];   // 🤝 傭兵引用其他存檔位；單角色備份一律不攜帶，避免幽靈傭兵
-        let _whRaw = _lzGet(whKey(_p));   // 🎮 指定角色（經典/非經典）對應的倉庫（💾 解壓成明文）
-        let _wh = (_whRaw == null) ? { items: [], gold: 0 } : JSON.parse(_whRaw);
-        if(!_wh || typeof _wh !== 'object' || !Array.isArray(_wh.items || [])) throw new Error('invalid warehouse');
-        _obj.wh = { items: _wh.items || [], gold: Number.isFinite(Number(_wh.gold)) ? Math.max(0, Math.floor(Number(_wh.gold))) : 0 };
+        let _wh = _readTransferObject(whKey(_p));
+        _obj.wh = normalizeWarehouseData(_wh == null ? { items: [], gold: 0 } : _wh);
+        let _whTombs = _readTransferObject(whKey(_p) + '_rm') || {};
+        _obj.wh.items = _obj.wh.items.filter(it => it.uid == null || !_whTombs[it.uid]);
         // 🐾 一併收錄模式共用寵物名冊，但匯出副本全部設為未出戰，避免其他角色歸屬在新環境永久卡住。
         let _petKey = (typeof PET_ROSTER_KEY !== 'undefined' ? PET_ROSTER_KEY : 'fb5_pet_roster') + (typeof modeSuffix === 'function' ? modeSuffix(!!(_p && _p.classicMode), false) : '');
-        let _petRaw = _lzGet(_petKey), _arr = [];
+        let _petRaw = _lzGetStrict(_petKey), _arr = [];
         if(_petRaw != null){
             let _pu = _saveUnwrap(_petRaw);
             if(!_pu || !_pu.ok) throw new Error('invalid pet roster signature');
@@ -520,6 +619,8 @@ async function exportSave(slot){
             if(!Array.isArray(_arr)) throw new Error('invalid pet roster');
         }
         _obj.pets = portablePetRoster(_arr);
+        _readTransferObject('fb5_pandora_relic_market_v1');   // 先拒絕損壞桶，避免共用 API 的預設值掩蓋遺失。
+        _readTransferObject(CLAN_STATE_KEY);
         if(typeof window.pandoraGetSharedDiamonds !== 'function') throw new Error('pandora diamond API unavailable');
         let _diamonds = Number(window.pandoraGetSharedDiamonds());
         if(!Number.isFinite(_diamonds)) throw new Error('invalid pandora diamonds');
@@ -592,6 +693,7 @@ function importSave(n){
         if(!file) return;
         let reader = new FileReader();
         reader.onload = function(){
+            try {
             let _raw = String(reader.result || '');
             const desktopImport = !!_FS;
             if(!desktopImport && _raw.startsWith('SIG2:')){
@@ -615,9 +717,7 @@ function importSave(n){
                 alert('匯入失敗：這是 Idle Lineage 安裝版匯出檔，網頁版資料與安裝版資料彼此獨立。');
                 return;
             }
-            if(!d || typeof d !== 'object' || !d.p || typeof d.p !== 'object' || !d.p.cls){
-                alert('匯入失敗：檔案內容不是有效的放置天堂存檔。'); return;
-            }
+            _validatePortableSave(d);   // 在覆蓋任何角色／共用桶之前確認可載入。
             let existing = slotSummary(n);
             if(existing){ alert(`存檔 ${n} 已有角色，請先刪除角色後再匯入。`); return; }
             // 同一角色不可複製到另一存檔格：寵物以 enSeed 判斷主人，重複身分會讓兩個角色共用出戰權。
@@ -642,8 +742,7 @@ function importSave(n){
             let pandoraDiamonds = d.pandoraDiamonds;
             let clanState = d.clanState;
             if(whData !== undefined){
-                if(!whData || typeof whData !== 'object' || !Array.isArray(whData.items || [])){ alert('匯入失敗：倉庫資料格式不正確。'); return; }
-                whData = { items: whData.items || [], gold: Number.isFinite(Number(whData.gold)) ? Math.max(0, Math.floor(Number(whData.gold))) : 0 };
+                whData = normalizeWarehouseData(whData);
             }
             if(petData !== undefined){
                 if(!Array.isArray(petData)){ alert('匯入失敗：寵物名冊格式不正確。'); return; }
@@ -713,42 +812,32 @@ function importSave(n){
                 writes.push({ key: petRestoreKey, value: _saveWrap(JSON.stringify(petData)) });
                 writes.push({ key: petRestoreKey + '_rm', value: _saveWrap('{}') });   // 🪦 清除舊放生墓碑，允許備份寵物合法還原
             }
-            let before = writes.map(w => ({ key: w.key, raw: _lsGet(w.key) }));
-            let beforePandoraDiamonds = restorePandoraDiamonds && typeof window.pandoraGetSharedDiamonds === 'function' ? Number(window.pandoraGetSharedDiamonds()) : null;
-            let beforeClanState = restoreClan && typeof window.clanExportSharedState === 'function' ? window.clanExportSharedState() : null;
-            let writeOk = true;
-            for(let w of writes){ if(!_lzSet(w.key, w.value)){ writeOk = false; break; } }
-            if(!writeOk){
-                for(let i = before.length - 1; i >= 0; i--){
-                    if(before[i].raw == null) _lzRemoveStored(before[i].key);
-                    else _lzSetStoredRaw(before[i].key, before[i].raw);
+            let keys = writes.map(w => w.key);
+            if (restorePandoraDiamonds) keys.push('fb5_pandora_relic_market_v1');
+            if (restoreClan) keys.push(CLAN_STATE_KEY);
+            // 保存原始位元組，連同外部 API 寫入的桶依提交反序回滾，避免重簽／膨脹造成配額不足。
+            let before = keys.map(key => ({ key: key, raw: _lsGetStrict(key) }));
+            let attempted = [];
+            try {
+                for(let i = 0; i < writes.length; i++) {
+                    attempted.push(before[i]);
+                    if(!_lzSet(writes[i].key, writes[i].value)) throw new Error('write failed');
                 }
-                alert('匯入失敗：儲存空間不足或寫入異常，已嘗試還原匯入前資料。');
+                if(restorePandoraDiamonds){
+                    attempted.push(before.find(entry => entry.key === 'fb5_pandora_relic_market_v1'));
+                    let result = typeof window.pandoraRestoreSharedDiamonds === 'function' && window.pandoraRestoreSharedDiamonds(pandoraDiamonds);
+                    if(!result || !result.ok) throw new Error('diamond restore failed');
+                }
+                if(restoreClan){
+                    attempted.push(before.find(entry => entry.key === CLAN_STATE_KEY));
+                    let result = typeof window.clanRestoreSharedState === 'function' && window.clanRestoreSharedState(clanState);
+                    if(!result || !result.ok) throw new Error('clan restore failed');
+                }
+            } catch(e) {
+                let restored = _restoreImportSnapshots(attempted);
+                try { if (typeof _npcClanWarCache !== 'undefined') { delete _npcClanWarCache.normal; delete _npcClanWarCache.classic; } } catch(_) {}
+                alert(restored ? '匯入失敗：寫入異常，已確認還原匯入前的角色與共用資料。' : '匯入失敗，且部分原始資料未能還原。請保留匯入檔、停止遊戲操作，先排除儲存空間或讀寫問題。');
                 return;
-            }
-            if(restorePandoraDiamonds){
-                let _pandoraResult = (typeof window.pandoraRestoreSharedDiamonds === 'function') ? window.pandoraRestoreSharedDiamonds(pandoraDiamonds) : null;
-                if(!_pandoraResult || !_pandoraResult.ok){
-                    for(let i = before.length - 1; i >= 0; i--){
-                        if(before[i].raw == null) _lzRemoveStored(before[i].key);
-                        else _lzSetStoredRaw(before[i].key, before[i].raw);
-                    }
-                    alert('匯入失敗：龍之鑽石資料無法安全還原，角色、倉庫與寵物資料已回復匯入前狀態。');
-                    return;
-                }
-            }
-            if(restoreClan){
-                let _clanResult = (typeof window.clanRestoreSharedState === 'function') ? window.clanRestoreSharedState(clanState) : null;
-                if(!_clanResult || !_clanResult.ok){
-                    for(let i = before.length - 1; i >= 0; i--){
-                        if(before[i].raw == null) _lzRemoveStored(before[i].key);
-                        else _lzSetStoredRaw(before[i].key, before[i].raw);
-                    }
-                    if(restorePandoraDiamonds && Number.isFinite(beforePandoraDiamonds) && typeof window.pandoraRestoreSharedDiamonds === 'function') window.pandoraRestoreSharedDiamonds(beforePandoraDiamonds);
-                    if(beforeClanState && typeof window.clanRestoreSharedState === 'function') window.clanRestoreSharedState(beforeClanState);
-                    alert('匯入失敗：血盟資料無法安全還原，角色、倉庫、寵物與龍之鑽石資料已嘗試回復匯入前狀態。');
-                    return;
-                }
             }
             if(restoreWh){
                 try { if(typeof _whLoadUids !== 'undefined') _whLoadUids = null; if(typeof _whLoadOk !== 'undefined') _whLoadOk = true; } catch(e){}
@@ -764,7 +853,11 @@ function importSave(n){
             renderLoadSelect();   // 重新整理存檔位清單（更新名稱/等級與可載入狀態）
             let ns = slotSummary(n);
             alert(`已匯入到存檔 ${n}：${ns ? (ns.cls + ' Lv.' + ns.lv + '　' + ns.name) : '完成'}。${whMsg}${petMsg}${pandoraMsg}${clanMsg}`);
+            } catch(e) {
+                alert('匯入失敗：資料格式或讀取異常。' + (e && e.message ? '\n' + e.message : ''));
+            }
         };
+        reader.onerror = function(){ alert('匯入失敗：無法讀取選取的存檔，未寫入資料。'); };
         reader.readAsText(file);
     };
     input.click();
@@ -853,6 +946,7 @@ function loadBackToMenu(){
 function returnToCharacterSelect(){
     if(typeof player === 'undefined' || !player || !player.cls) return false;
     _flushSaveNow();   // 🗑️ v3.7.94 原本走 js/27 的 offlinePrepareCharacterSelect（存檔＋寫離線快照）；離線掛機移除後只留最終存檔
+    if (typeof resetWorldChannelSession === 'function') resetWorldChannelSession();
 
     if(typeof stopGameTimers === 'function') stopGameTimers();
     if(typeof state !== 'undefined' && state) state.running = false;
@@ -1255,6 +1349,7 @@ function startGame() {
     _uiConfigReady = false;   // 還原期間 DOM 仍是上一角色的設定 → 禁止 saveGame 以它重建 config（與 loadGame 同一守則）
     try { if (typeof _petRosterDirty !== 'undefined' && _petRosterDirty && player && player.cls && typeof petRosterSave === 'function') petRosterSave(); } catch (e) {}   // 上一角色未寫入的寵物名冊先 flush（比照 loadGame）
     try { if (typeof _petRosterKey !== 'undefined') _petRosterKey = null; } catch (e) {}   // 失效記憶體快取→新角色重新從共用桶載入（防跨角色髒鏡像）
+    if (typeof resetWorldChannelSession === 'function') resetWorldChannelSession();
     if (typeof freshPlayerState === 'function') player = freshPlayerState();
     if (typeof freshMapState === 'function') mapState = freshMapState();
     if(typeof stopCreationFrameSfx === 'function') stopCreationFrameSfx();
@@ -1456,20 +1551,24 @@ function normalizeFacingRefsForSave() {
         else if(m._faceTgt._slot != null) m._facePartyKey = 'A:' + String(m._faceTgt._slot);
         delete m._faceTgt;
     });
-    if (typeof stripThreatForSave === 'function') stripThreatForSave();   // 🎯 v3.7.97 仇恨制：mob._threat/_threatT 是 runtime 狀態·不入檔（也避免進 SIG1 簽章）
 }
 function saveStateJson() {
     normalizeFacingRefsForSave();
     // Facing references are normalized above. Avoid a replacer callback for every field in
     // the save, which becomes noticeably expensive for large inventories and companion data.
-    // 🧙 v3.2.40 稽核修：v2 召喚實體＝戰鬥暫存不入檔（設計即「讀檔後自動重施」）——暫時摘下再復原，
-    //   避免舊怪名殘留在存檔造成讀檔 null-deref，也避免每次讀檔誤報「契約到期」＋存檔肥大。
-    let _sv2 = player.summonsV2;
-    if (_sv2 && _sv2.length) player.summonsV2 = [];
-    let _gv2 = player.guardsV2;   // 🏰 城堡護衛實體同召喚：戰鬥暫存不入檔（名冊在血盟共用狀態·讀檔後 castleGuardSync 依名冊重建）
-    if (_gv2 && _gv2.length) player.guardsV2 = [];
-    try { return JSON.stringify({ v: SAVE_VERSION, p: player, ms: mapState, ticks: state.ticks }); }
-    finally { if (_sv2 && _sv2.length) player.summonsV2 = _sv2; if (_gv2 && _gv2.length) player.guardsV2 = _gv2; }
+    // 戰鬥暫存僅從存檔副本排除；存檔成功或失敗都不改動當前仇恨、嘲諷、召喚與護衛。
+    let savedPlayer = { ...player };
+    if (player.summonsV2 && player.summonsV2.length) savedPlayer.summonsV2 = [];
+    if (player.guardsV2 && player.guardsV2.length) savedPlayer.guardsV2 = [];
+    let savedMap = { ...mapState, mobs: ((mapState && mapState.mobs) || []).map(m => {
+        if (!m) return m;
+        let savedMob = { ...m };
+        delete savedMob._threat;
+        delete savedMob._threatT;
+        delete savedMob._ironGuardTaunt;
+        return savedMob;
+    }) };
+    return JSON.stringify({ v: SAVE_VERSION, p: savedPlayer, ms: savedMap, ticks: state.ticks });
 }
 // 🤝 v3.8.2 受僱中角色「經驗只增不減」防護（用戶指定）：擔任傭兵的角色被鎖在安全區、無法自行掛機打怪，
 //    其存檔經驗的唯一來源＝待領帳本領取（additive）。若另一情境（別分頁／先前一次領取）已把「磁碟上的」
@@ -1494,7 +1593,111 @@ function _mercMonotonicExpGuard() {
         try { logSys(`<span class="text-emerald-300">受僱中偵測到存檔經驗較新（Lv.${dLv}），已保留較高進度、不以舊經驗覆蓋。</span>`); } catch (e) {}
     } catch (e) {}
 }
+// 製作／卡片交易在同一個同步事件中執行；畫面與成功訊息於持久化完成後才發布。
+function _deferItemTransactionEffect(fn, args, repeat) {
+    if (typeof _itemTransaction === 'undefined' || !_itemTransaction) return false;
+    let call = { fn: fn, args: Array.from(args || []) };
+    if (repeat) _itemTransaction.effects.push(call);
+    else _itemTransaction.renders.set(fn, call);
+    return true;
+}
+function _itemTransactionAbort(message) {
+    let error = new Error(message || 'Item transaction cancelled');
+    if (_itemTransaction) _itemTransaction.error = error;
+    throw error;
+}
+function _itemTransactionCount(value) {
+    let count = value === undefined ? 1 : value;
+    if (!Number.isSafeInteger(count) || count <= 0) _itemTransactionAbort('物品數量無法安全計算');
+    return count;
+}
+// 記錄原物件及原欄位，回復時保留 uid 物件、裝備引用與循環引用的身分。
+// 僅複製可變欄位表，不做 JSON 深拷貝，不把 DOM 或原型物件納入。
+function _snapshotItemTransactionObjects(roots) {
+    let seen = new Set(), snapshots = [];
+    function visit(value) {
+        if (!value || typeof value !== 'object' || seen.has(value)) return;
+        let proto = Object.getPrototypeOf(value);
+        if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) return;
+        seen.add(value);
+        let fields = Object.entries(value);
+        snapshots.push({ value: value, fields: fields, length: Array.isArray(value) ? value.length : null });
+        for (let entry of fields) visit(entry[1]);
+    }
+    roots.forEach(visit);
+    return function restore() {
+        for (let entry of snapshots) {
+            let keys = new Set(entry.fields.map(pair => pair[0]));
+            for (let key of Object.keys(entry.value)) if (!keys.has(key)) delete entry.value[key];
+            for (let pair of entry.fields) entry.value[pair[0]] = pair[1];
+            if (entry.length !== null) entry.value.length = entry.length;
+        }
+    };
+}
+function runItemTransaction(label, action) {
+    if (_itemTransaction) return action();
+    if (!_itemTransactionLockHeld) return _withItemTransactionLock(() => runItemTransaction(label, action), label);
+    if (!player || !player.cls || player.dead) return false;
+    let tx = { pending: new Map(), before: new Map(), error: null, effects: [], renders: new Map(), saveRequested: false };
+    let restore = _snapshotItemTransactionObjects([player, mapState, _audit, MISC_ITEM_CAT, MISC_CAT_ITEMS]);
+    let flags = [_craftBlessCount, _lockMergeOff, _tradLootCtx, _noAffixCtx, _forceBless, _forceSherineSet, _vfxLootCtx];
+    let result, completed = false;
+    _itemTransaction = tx;
+    _vfxLootCtx = false;
+    try {
+        if (_itemTransactionStorageBlocked) _itemTransactionAbort('儲存資料尚待復原');
+        let storedRaw = _lzGetStrict('lineage_idle_save_' + currentSlot);
+        if (storedRaw != null) {
+            let stored = _saveUnwrap(storedRaw);
+            if (stored.signed && !stored.ok) _itemTransactionAbort('角色存檔校驗失敗');
+            let data = JSON.parse(stored.payload);
+            if (!data || !data.p || typeof data.p !== 'object' || Array.isArray(data.p) || !data.p.cls)
+                _itemTransactionAbort('角色存檔無法完整讀取');
+        }
+        // 同時將角色身分讀取納入衝突檢查；不能對已刪除或已換人的存檔位扣料。
+        if (!_roleSaveAllowed()) _itemTransactionAbort('角色存檔位已變更');
+        // 合法舊存檔的缺省數量為 1；統一後再計算材料池，避免 undefined/字串參與加減。
+        for (let item of player.inv) item.cnt = _itemTransactionCount(item.cnt);
+        if (typeof _lkInvalidateWhCache === 'function') _lkInvalidateWhCache();
+        result = action();
+        if (tx.error) throw tx.error;
+        if (tx.saveRequested || tx.pending.size) {
+            if (typeof sanitizeState === 'function') sanitizeState();
+            _mercMonotonicExpGuard();
+            // 這些操作不改寵物名冊，直接保存角色，避免 saveGame 的寵物第二階段另開交易。
+            if (!_lzSet('lineage_idle_save_' + currentSlot, _saveWrap(saveStateJson())))
+                _itemTransactionAbort('角色存檔準備失敗');
+        }
+        if (tx.error) throw tx.error;
+        _itemTransaction = null;
+        if (!_commitItemTransaction(tx)) throw tx.error || new Error('儲存失敗或資料已被其他視窗更新');
+        completed = true;
+    } catch (e) {
+        restore();
+        try { console.error('[item transaction] ' + label, e); } catch (_) {}
+    } finally {
+        _itemTransaction = null;
+        [_craftBlessCount, _lockMergeOff, _tradLootCtx, _noAffixCtx, _forceBless, _forceSherineSet, _vfxLootCtx] = flags;
+        if (typeof resetCatchupGainItemIndex === 'function') resetCatchupGainItemIndex();
+        if (typeof _lkInvalidateWhCache === 'function') _lkInvalidateWhCache();
+        // 暫存的倉庫物件不能被後續操作當成已提交快照。
+        _whLastSnapshot = null; _whLoadUids = null;
+    }
+    if (!completed) {
+        logSys('<span class="text-red-400 font-bold">' + label + '已取消：資料未能完整儲存，材料與獎勵已回復。請排除儲存問題後再試。</span>');
+        if (typeof _itemTransactionStorageBlocked !== 'undefined' && _itemTransactionStorageBlocked)
+            logSys('<span class="text-red-400 font-bold">儲存裝置尚未完成回復，已保留復原紀錄並暫停寫入；請修復儲存問題後重新開啟遊戲。</span>');
+        return false;
+    }
+    // UI 例外不能把已落盤的成功交易重新當成失敗、再退還材料。
+    for (let call of tx.effects.concat(Array.from(tx.renders.values()))) {
+        try { call.fn.apply(null, call.args); } catch (e) { console.error('[item transaction UI]', e); }
+    }
+    return result === undefined ? true : result;
+}
+
 function saveGame() {
+    if (typeof _itemTransaction !== 'undefined' && _itemTransaction) { _itemTransaction.saveRequested = true; return true; }
     // 死亡狀態不寫檔：避免把 player.dead=true 存進去，導致下次讀檔卡在死亡狀態而不出怪。
     // 死亡期間沒有可保存的進度，保留上一份「存活」存檔即可。
     if (player && player.dead) return false;
@@ -1649,9 +1852,13 @@ function loadGame() {
         //    → 該欄位在載入畫面顯示為空、empty=true → 「匯入進度」可見而「刪除角色」被 hidden。
         //    舊文案多寫的「仍可用『刪除角色』清空」正好點名此情境唯一看不見的那顆按鈕，故移除。
         let d; try { d = JSON.parse(s); } catch(e){ alert('此存檔位的資料已毀損，無法載入。\n此欄位在載入畫面會顯示為空，請直接按「匯入進度」還原先前匯出的 .json 備份檔。'); return; }
+        try { _validatePortableSave(d); }
+        catch(e){ alert('無法載入：' + e.message + '\n原始存檔尚未變更，請使用完整備份或相容版本。'); return; }
+        if (typeof resetWorldChannelSession === 'function') resetWorldChannelSession();
         player = d.p; mapState = d.ms;
         delete player.offlineHunt;   // 🗑️ v3.7.94 離線掛機已移除：舊存檔的逐地圖速率快照沒有讀取者，載入即丟掉（否則每次存檔都白帶一份）
         normalizeFacingRefsForSave();   // 舊存檔若含 v3.2.12 面向物件副本，載入時立即轉為 UID／隊員鍵並移除物件參照
+        if (typeof stripThreatForSave === 'function') stripThreatForSave();   // 舊存檔若帶戰鬥暫存，僅在讀檔時清除。
         if (typeof applyGlobalAutoSellSettings === 'function') applyGlobalAutoSellSettings();   // 🔧 v2.6.91 功能5：載入角色時套用全域自動販賣設定（8 角色共用時覆蓋本檔規則）
         if (!player.enSeed) player.enSeed = 'es' + _seedHash((player.name || '') + '|' + (player.cls || '') + '|lz').toString(36);   // 🎲 舊存檔無強化種子：由角色名+職業決定論衍生（重匯入同一份舊檔也得相同種子→不能靠重匯入重洗強化）
         if (typeof sanitizeState === 'function') sanitizeState();   // 🛡️ 讀檔後合理性夾擠（抓改過/竄改的存檔：等級>100、強化值超上限、負金幣等）

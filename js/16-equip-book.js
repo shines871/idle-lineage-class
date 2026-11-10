@@ -79,6 +79,12 @@ const EQUIP_CAT_BONUS = {
 // ---- 將一件裝備分到部位 key（回傳 null＝不收錄，例如箭矢、非裝備）----
 function equipCatKey(id, d) {
     if (!d) return null;
+    if (d.relicBaseId !== undefined) {
+        let baseId = d.relicBaseId, base = typeof baseId === 'string' && DB.items[baseId];
+        if (!base || base.relic || base.relicBaseId !== undefined) return null;
+        if (base.type === 'wpn' && base.isArrow) return isRelic(d) ? 'quiver' : null;
+        return equipCatKey(baseId, base); // 原型名稱參與十字弓、魔杖等分類，不能改看遺物的新名字。
+    }
     if (d.type === 'wpn') {
         if (d.isArrow) return (typeof isRelic === 'function' && isRelic(d)) ? 'quiver' : null;   // 🏺 v3.2.0 遺物箭筒歸「箭筒」分類（供遺物收集冊）；一般箭矢＝彈藥，不收錄
         if (d.isBow) return /十字弓|弩/.test(d.n || '') ? 'xbow' : 'bow';

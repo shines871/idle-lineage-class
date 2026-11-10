@@ -444,6 +444,7 @@ function craftActionHtml(npcId, idx) {
 }
 
 function renderUniversalCraft(div, npcId) {
+    if (_deferItemTransactionEffect(renderUniversalCraft, arguments)) return;
     let recipes = CRAFT_RECIPES[npcId];
     if (!recipes) return;
     if (!RECIPE_BY_RESULT) buildRecipeIndex();
@@ -494,8 +495,8 @@ const DEMONKING_RECIPES = [
 ];
 // 背包＋倉庫中可作素材的 +11 以上指定惡魔武器：優先「有席琳套裝」者，其次「強化值最高」者；未鎖定
 function findDemonKingSource(srcId) {
-    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 11 && !i.lock);
-    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 11 && !i.lock).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +11 惡魔武器亦可作素材（_whSource 標記：消耗時自倉庫精準扣除）
+    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 11 && !i.lock && (i.cnt == null || i.cnt >= 1));
+    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 11 && !i.lock && (i.cnt == null || i.cnt >= 1)).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +11 惡魔武器亦可作素材（_whSource 標記：消耗時自倉庫精準扣除）
     if (!cands.length) return null;
     let withSet = cands.filter(i => i.seteff);
     let pool = (withSet.length ? withSet : cands).slice().sort((a, b) => (b.en || 0) - (a.en || 0));
@@ -532,6 +533,7 @@ function buildDemonKingCraftHTML() {
     return html;
 }
 function doDemonKingCraft(idx) {
+    if (!_itemTransaction) return runItemTransaction('製作', () => doDemonKingCraft(idx));
     let r = DEMONKING_RECIPES[idx];
     if (!r) return;
     if (!RECIPE_BY_RESULT) buildRecipeIndex();
@@ -542,8 +544,7 @@ function doDemonKingCraft(idx) {
     DEMONKING_MATS.forEach(m => ensureMaterial(m.id, m.cnt, 0));   // 🔧 先自動補製可合成的中間物（黑色米索莉金屬板等），玩家不需先手動製作金屬板
     DEMONKING_MATS.forEach(m => consumeMaterialById(m.id, m.cnt));
     let inherit = { en: src.en || 0, attr: src.attr || false, bless: src.bless ? src.bless : rollAffixesNew(0.10).bless, anc: src.anc || false, seteff: src.seteff || false };   // 🔧 祝福傳承：來源祝福/詛咒→沿用；來源無詞綴→製作 10% 重骰祝福
-    if (src._whSource) { whRemoveStackByUid(src.uid, 1); }   // 🔧 來源武器在倉庫：自倉庫精準消耗該實例
-    else if ((src.cnt || 1) > 1) src.cnt -= 1; else player.inv = player.inv.filter(i => i.uid !== src.uid);   // 消耗 1 把來源惡魔武器（背包）
+    if (!_consumeCraftSource(src)) return;
     let inst = { id: r.result, uid: uid(), cnt: 1, en: inherit.en, attr: inherit.attr, bless: inherit.bless, anc: inherit.anc, seteff: inherit.seteff, lock: false };
     invAddOrStack(inst);
     if (typeof registerEquipObtained === 'function') registerEquipObtained(inst.id);   // 🗡️ 客製製作直推 inv（未經 gainItem）→ 需手動登錄裝備收集冊，否則圖鑑保持暗直到重登(ensureEquipBook 補登)
@@ -557,8 +558,8 @@ const LUMIEL_RECIPES = [
     { result: 'clk_holy_corps', src: 'clk_warrior_corps', srcName: '戰士團斗篷', mats: [{ id: 'new_item_156', cnt: 1 }, { id: 'new_item_161', cnt: 5 }, { id: 'new_item_157', cnt: 30 }, { id: 'new_item_151', cnt: 30 }] },
 ];
 function findLumielSource(srcId) {
-    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock);
-    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +7 戰士團裝備亦可作素材
+    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock && (i.cnt == null || i.cnt >= 1));
+    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock && (i.cnt == null || i.cnt >= 1)).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +7 戰士團裝備亦可作素材
     if (!cands.length) return null;
     let withSet = cands.filter(i => i.seteff);
     let pool = (withSet.length ? withSet : cands).slice().sort((a, b) => (b.en || 0) - (a.en || 0));
@@ -595,6 +596,7 @@ function buildLumielCraftHTML() {
     return html;
 }
 function doLumielCraft(idx) {
+    if (!_itemTransaction) return runItemTransaction('製作', () => doLumielCraft(idx));
     let r = LUMIEL_RECIPES[idx];
     if (!r) return;
     if (!RECIPE_BY_RESULT) buildRecipeIndex();
@@ -605,8 +607,7 @@ function doLumielCraft(idx) {
     r.mats.forEach(m => ensureMaterial(m.id, m.cnt, 0));   // 🔧 先自動補製可合成的中間物，玩家不需先手動製作
     r.mats.forEach(m => consumeMaterialById(m.id, m.cnt));
     let inherit = { en: src.en || 0, attr: src.attr || false, bless: src.bless ? src.bless : rollAffixesNew(0.10).bless, anc: src.anc || false, seteff: src.seteff || false };   // 🔧 祝福傳承：來源祝福/詛咒→沿用；來源無詞綴→製作 10% 重骰祝福
-    if (src._whSource) { whRemoveStackByUid(src.uid, 1); }   // 來源裝備在倉庫：自倉庫精準消耗
-    else if ((src.cnt || 1) > 1) src.cnt -= 1; else player.inv = player.inv.filter(i => i.uid !== src.uid);   // 消耗 1 件來源戰士團裝備（背包）
+    if (!_consumeCraftSource(src)) return;
     let inst = { id: r.result, uid: uid(), cnt: 1, en: inherit.en, attr: inherit.attr, bless: inherit.bless, anc: inherit.anc, seteff: inherit.seteff, lock: false };
     invAddOrStack(inst);
     if (typeof registerEquipObtained === 'function') registerEquipObtained(inst.id);   // 🗡️ 客製製作直推 inv（未經 gainItem）→ 需手動登錄裝備收集冊，否則圖鑑保持暗直到重登(ensureEquipBook 補登)
@@ -623,8 +624,8 @@ const MYSTICWAND_RECIPES = [
 ];
 // 背包＋倉庫中可作素材的 +7 以上來源魔杖；未鎖定。成品為 +0 白板 → 挑「最不值錢」的那把：強化值最低者優先，同強化值再避開有詞綴／屬性／席琳套裝者。
 function findMysticWandSource(srcId) {
-    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock);
-    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +7 魔杖亦可作素材（_whSource 標記：消耗時自倉庫精準扣除）
+    let cands = player.inv.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock && (i.cnt == null || i.cnt >= 1));
+    try { loadWarehouse().items.filter(i => i.id === srcId && (i.en || 0) >= 7 && !i.lock && (i.cnt == null || i.cnt >= 1)).forEach(i => cands.push(Object.assign({}, i, { _whSource: true }))); } catch (e) {}   // 🔧 倉庫中的 +7 魔杖亦可作素材（_whSource 標記：消耗時自倉庫精準扣除）
     if (!cands.length) return null;
     let _extra = i => (i.seteff ? 4 : 0) + (i.bless ? 2 : 0) + (i.attr ? 1 : 0);   // 附加價值愈高愈晚被消耗
     return cands.slice().sort((a, b) => ((a.en || 0) - (b.en || 0)) || (_extra(a) - _extra(b)))[0];
@@ -660,6 +661,7 @@ function buildMysticWandCraftHTML() {
     return html;
 }
 function doMysticWandCraft(idx) {
+    if (!_itemTransaction) return runItemTransaction('製作', () => doMysticWandCraft(idx));
     let r = MYSTICWAND_RECIPES[idx];
     if (!r) return;
     if (!RECIPE_BY_RESULT) buildRecipeIndex();
@@ -669,8 +671,7 @@ function doMysticWandCraft(idx) {
     if (lack.length) { logSys(`<span class="text-red-400 font-bold">材料不足，無法製作。</span><span class="text-red-300">（尚缺：${lack.join('、')}）</span>`); return; }
     MYSTICWAND_MATS.forEach(m => ensureMaterial(m.id, m.cnt, 0));   // 🔧 先自動補製可合成的中間物
     MYSTICWAND_MATS.forEach(m => consumeMaterialById(m.id, m.cnt));
-    if (src._whSource) { whRemoveStackByUid(src.uid, 1); }   // 來源魔杖在倉庫：自倉庫精準消耗該實例
-    else if ((src.cnt || 1) > 1) src.cnt -= 1; else player.inv = player.inv.filter(i => i.uid !== src.uid);   // 消耗 1 把來源魔杖（背包）
+    if (!_consumeCraftSource(src)) return;
     gainItem(r.result, 1, true, false, false, false, null, 0.10);   // 成品恆 +0（不繼承來源強化值／屬性／詞綴）；製作 10% 祝福
     logSys(`<span class="text-amber-200 font-bold">神秘的魔法師</span> 製作完成：<span class="${getItemColor({ id: r.result })} font-bold">${DB.items[r.result].n}</span>`);
     updateUI(); renderTabs(true); saveGame();
@@ -717,6 +718,7 @@ function buildSlayerCraftHTML() {
     return html;
 }
 function doSlayerCraft(idx) {
+    if (!_itemTransaction) return runItemTransaction('製作', () => doSlayerCraft(idx));
     let r = SLAYER_RECIPES[idx];
     if (!r) return;
     if (!RECIPE_BY_RESULT) buildRecipeIndex();
@@ -726,8 +728,7 @@ function doSlayerCraft(idx) {
     if (lack.length) { logSys(`<span class="text-red-400 font-bold">材料不足，無法製作。</span><span class="text-red-300">（尚缺：${lack.join('、')}）</span>`); return; }
     r.mats.forEach(m => ensureMaterial(m.id, m.cnt, 0));   // 🔧 先自動補製可合成的中間物（古老的盔甲可由迪泰特配方遞迴合成）
     r.mats.forEach(m => consumeMaterialById(m.id, m.cnt));
-    if (src._whSource) { whRemoveStackByUid(src.uid, 1); }   // 來源鏈甲在倉庫：自倉庫精準消耗該實例
-    else if ((src.cnt || 1) > 1) src.cnt -= 1; else player.inv = player.inv.filter(i => i.uid !== src.uid);   // 消耗 1 件來源鏈甲（背包）
+    if (!_consumeCraftSource(src)) return;
     gainItem(r.result, 1, true, false, false, false, null, 0.10);   // 成品恆 +0（不繼承來源強化值／詞綴）；製作 10% 祝福
     logSys(`<span class="text-amber-200 font-bold">宙斯之熔岩高崙</span> 製作完成：<span class="${getItemColor({ id: r.result })} font-bold">${DB.items[r.result].n}</span>`);
     updateUI(); renderTabs(true); saveGame();
@@ -736,6 +737,7 @@ function doSlayerCraft(idx) {
 
 // 2. 渲染茉莉的製作介面
 function renderMoliCraft(div) {
+    if (_deferItemTransactionEffect(renderMoliCraft, arguments)) return;
     let recipes = CRAFT_RECIPES['npc_moli'];
     let html = '';
     
@@ -768,6 +770,7 @@ function renderMoliCraft(div) {
 }
 // 渲染布拉伯的製作介面
 function renderBraboCraft(div) {
+    if (_deferItemTransactionEffect(renderBraboCraft, arguments)) return;
     let recipes = CRAFT_RECIPES['npc_brabo'];
     let html = '';
     
@@ -798,6 +801,7 @@ function renderBraboCraft(div) {
     div.innerHTML = html;
 }
 function renderFinnCraft(div, npcId) {
+    if (_deferItemTransactionEffect(renderFinnCraft, arguments)) return;
     let recipes = CRAFT_RECIPES[npcId];
     let html = '';
     
@@ -828,6 +832,7 @@ function renderFinnCraft(div, npcId) {
     div.innerHTML = html;
 }
 function renderJoelCraft(div, npcId) {
+    if (_deferItemTransactionEffect(renderJoelCraft, arguments)) return;
     let recipes = CRAFT_RECIPES[npcId];
     let html = '';
     
@@ -902,7 +907,10 @@ let _whSyncCache = null;
 function _whReadCached() {
     if (_whSyncCache) return _whSyncCache;
     let w = loadWarehouse();
+    if (_itemTransaction && !_whLoadOk) _itemTransactionAbort('倉庫材料無法完整讀取，製作已取消。');
     _whSyncCache = w;
+    // saveWarehouse 成功暫存後會失效此快取；交易入口及結束也清除，保留同輪唯讀重用。
+    if (_itemTransaction) return w;
     let clear = () => { _whSyncCache = null; };
     if (typeof queueMicrotask === 'function') queueMicrotask(clear); else Promise.resolve().then(clear);
     return w;
@@ -916,12 +924,19 @@ function whConsumeId(id, n) {   // 自倉庫扣除最多 n 個（白板/低強�
     try {
         let w = loadWarehouse();
         let need = n, stacks = w.items.filter(i => i.id === id && !i.lock);   // 🔒 鎖定件不得當材料銷毀（與三個客製製作 findXxxSource 一致）
+        if (_itemTransaction && !(stacks.reduce((sum, i) => sum + i.cnt, 0) >= n)) _itemTransactionAbort('倉庫材料不足，操作已取消。');
         stacks.sort((a, b) => (((a.en||0)*100)+(a.anc?10:0)+(a.bless?10:0)+(a.attr?10:0)+(a.seteff?50:0)) - (((b.en||0)*100)+(b.anc?10:0)+(b.bless?10:0)+(b.attr?10:0)+(b.seteff?50:0)));
         for (let st of stacks) { if (need <= 0) break; let d = Math.min(st.cnt, need); if (d > 0 && st.bless === true) _craftBlessCount += d; st.cnt -= d; need -= d; }   // 🔧 v3.1.27 倉庫祝福裝備材料件數累加
         w.items = w.items.filter(i => i.cnt == null || i.cnt > 0);   // ⚠️ null-safe：cnt 未定義的舊存檔物品不得被當成 0 而靜默刪除
-        saveWarehouse(w);
+        if (!saveWarehouse(w)) {
+            if (_itemTransaction) _itemTransactionAbort('倉庫儲存失敗，操作已取消。');
+            return 0;
+        }
         return n - need;
-    } catch (e) { return 0; }
+    } catch (e) {
+        if (_itemTransaction) _itemTransactionAbort(e && e.message || '倉庫扣料失敗，操作已取消。');
+        return 0;
+    }
 }
 // 🔧 自倉庫精準移除指定 uid 的堆疊（n 預設 1）：強化/詞綴/席琳套裝武器作素材時，消耗該唯一實例
 function whRemoveStackByUid(uid, n) {
@@ -929,12 +944,32 @@ function whRemoveStackByUid(uid, n) {
     try {
         let w = loadWarehouse();
         let idx = w.items.findIndex(i => i.uid === uid);
-        if (idx < 0) return false;
         let st = w.items[idx];
+        if (!st || st.lock || !((st.cnt == null ? 1 : st.cnt) >= n)) {
+            if (_itemTransaction) _itemTransactionAbort('來源裝備不足或已鎖定，製作已取消。');
+            return false;
+        }
         if ((st.cnt || 1) > n) st.cnt -= n; else w.items.splice(idx, 1);
-        saveWarehouse(w);
+        if (!saveWarehouse(w)) {
+            if (_itemTransaction) _itemTransactionAbort('倉庫儲存失敗，製作已取消。');
+            return false;
+        }
         return true;
-    } catch (e) { return false; }
+    } catch (e) {
+        if (_itemTransaction) _itemTransactionAbort(e && e.message || '來源裝備扣除失敗，製作已取消。');
+        return false;
+    }
+}
+// 客製製作最後重新核對來源實例；前置遞迴製作不得讓已消耗的來源裝備再次兌換。
+function _consumeCraftSource(src) {
+    if (src && src._whSource) return whRemoveStackByUid(src.uid, 1);
+    let st = src && player.inv.find(i => i.uid === src.uid && i.id === src.id);
+    if (!st || st.lock || !((st.cnt == null ? 1 : st.cnt) >= 1)) {
+        if (_itemTransaction) _itemTransactionAbort('來源裝備不足或已鎖定，製作已取消。');
+        return false;
+    }
+    if ((st.cnt || 1) > 1) st.cnt -= 1; else player.inv = player.inv.filter(i => i.uid !== st.uid);
+    return true;
 }
 // 試煉兌換用：背包＋倉庫合併計數 / 扣除
 function questCountId(id) { return player.inv.filter(i => i.id === id && !i.lock).reduce((s, i) => s + i.cnt, 0) + whCountId(id); }   // 🔒 鎖定件不列入
@@ -969,10 +1004,12 @@ function lockHintHtml(ids) {
     return `<span class="text-slate-400">（提示：${hit.map(h => `${(DB.items[h.id] || {}).n || h.id} 有 ${h.n} 個已上鎖`).join('、')}·上鎖物品不會被使用，可解鎖後再試）</span>`;
 }
 function questConsumeId(id, n) {
+    if (_itemTransaction && !(questCountId(id) >= n)) _itemTransactionAbort('兌換材料不足，操作已取消。');
     let need = n, _gone = new Set();
     for (let it of player.inv.filter(i => i.id === id && !i.lock)) { if (need <= 0) break; let d = Math.min(it.cnt, need); it.cnt -= d; need -= d; if (it.cnt <= 0) _gone.add(it.uid); }   // 🔒 鎖定件不得被任務兌換吃掉
     if (_gone.size) player.inv = player.inv.filter(i => !_gone.has(i.uid));   // ⚠️ uid 精準移除：舊寫法 filter(i=>i.cnt>0) 會把 cnt 未定義的舊存檔物品連同鎖定件一併靜默刪除
-    if (need > 0) whConsumeId(id, need);
+    if (need > 0) need -= whConsumeId(id, need);
+    if (_itemTransaction && need > 0) _itemTransactionAbort('兌換材料扣除不足，操作已取消。');
 }
 
 function invCountId(id) {
@@ -1018,6 +1055,7 @@ function materialObtainable(id, cnt) {
     return simulateMake(id, cnt, buildPool(), 0);
 }
 function consumeMaterialById(id, n) {
+    if (_itemTransaction && !(invCountId(id) >= n)) _itemTransactionAbort('製作材料或金幣不足，操作已取消。');
     if (id === 'gold') { player.gold -= n; return; }
     let need = n, stacks = player.inv.filter(i => i.id === id && !i.lock), _gone = new Set();   // 🔒 鎖定件不得當材料銷毀
     // ⚠️ 排序鍵須與 whConsumeId(倉庫) 完全一致，含 seteff（席琳套裝詞綴）權重 50，否則同一件裝備
@@ -1025,14 +1063,21 @@ function consumeMaterialById(id, n) {
     stacks.sort((a, b) => (((a.en||0)*100)+(a.anc?10:0)+(a.bless?10:0)+(a.attr?10:0)+(a.seteff?50:0)) - (((b.en||0)*100)+(b.anc?10:0)+(b.bless?10:0)+(b.attr?10:0)+(b.seteff?50:0)));
     for (let st of stacks) { if (need <= 0) break; let d = Math.min(st.cnt, need); if (d > 0 && st.bless === true) _craftBlessCount += d; st.cnt -= d; need -= d; if (st.cnt <= 0) _gone.add(st.uid); }   // 🔧 v3.1.27 祝福裝備材料件數累加（供 doCraft 逐件強制祝福）
     if (_gone.size) player.inv = player.inv.filter(i => !_gone.has(i.uid));   // ⚠️ uid 精準移除（舊寫法 i.cnt>0 會誤刪 cnt 未定義的舊物品）
-    if (need > 0) whConsumeId(id, need);   // 🔧 背包不足：自倉庫扣除
+    if (need > 0) need -= whConsumeId(id, need);   // 🔧 背包不足：自倉庫扣除
+    if (_itemTransaction && need > 0) _itemTransactionAbort('製作材料扣除不足，操作已取消。');
 }
 function ensureMaterial(id, count, depth) {
-    if (id === 'gold' || depth > 24) return;
+    if (depth > 24) {
+        if (_itemTransaction) _itemTransactionAbort('製作配方遞迴過深，操作已取消。');
+        return;
+    }
     let have = invCountId(id);
     if (have >= count) return;
-    let rec = RECIPE_BY_RESULT[id];
-    if (!rec) return;
+    let rec = id !== 'gold' && RECIPE_BY_RESULT[id];
+    if (!rec) {
+        if (_itemTransaction) _itemTransactionAbort('缺少無法補製的材料或金幣，操作已取消。');
+        return;
+    }
     let need = count - have, y = rec.yield || 1, batches = Math.ceil(need / y);
     for (let req of rec.req) ensureMaterial(req.id, req.cnt * batches, depth + 1);
     for (let req of rec.req) consumeMaterialById(req.id, req.cnt * batches);
@@ -1041,6 +1086,7 @@ function ensureMaterial(id, count, depth) {
     //    若併進鎖定疊就會「底層材料被吃掉、中間物卻沒扣」（v3.5.85 修過的帳目錯亂）。殘量待下次載入合併回去。
     _lockMergeOff = true;
     try { gainItem(id, batches * y, true, true); } finally { _lockMergeOff = false; }
+    if (_itemTransaction && !(invCountId(id) >= count)) _itemTransactionAbort('中間材料產出不足，製作已取消。');
 }
 // 計算製作 count 個某配方時，缺少的「最底層材料 / 金幣」與數量（遞迴展開中間物）
 function craftReqHtml(reqArr) {
@@ -1081,6 +1127,7 @@ function craftShortfall(recipe, count) {
     return lack;
 }
 function doCraft(npcId, recipeIdx, sherine) {   // 🔮 sherine 參數保留簽章相容；⚠️v3.1.68 席琳製作已移除（詞綴不再附於裝備·改由遺骸承載）
+    if (!_itemTransaction) return runItemTransaction('製作', () => doCraft(npcId, recipeIdx, sherine));
     sherine = false;   // 🦴 v3.1.68 縱深防護：任何殘留呼叫都不再扣結晶/附詞綴（綠鈕已由 craftActionHtml _shOk=false 隱藏）
     let recipe = CRAFT_RECIPES[npcId][recipeIdx];
     if (!recipe) return;
@@ -1162,8 +1209,11 @@ function doCraft(npcId, recipeIdx, sherine) {   // 🔮 sherine 參數保留簽�
     }
 
     // 數量設定：選擇數量超過可製作數 → 回到 1；否則保留所選數量
-    let qtyInput2 = document.getElementById(`craft-qty-${npcId}-${recipeIdx}`);
-    if (qtyInput2) qtyInput2.value = (qty > maxCraftable) ? 1 : qty;
+    let updateQty = () => {
+        let qtyInput2 = document.getElementById(`craft-qty-${npcId}-${recipeIdx}`);
+        if (qtyInput2) qtyInput2.value = (qty > maxCraftable) ? 1 : qty;
+    };
+    if (!_deferItemTransactionEffect(updateQty, [])) updateQty();
 
     saveGame();
 }

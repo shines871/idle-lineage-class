@@ -444,15 +444,16 @@ function applyWeaponProcPoison(target, pp, finalMult, src) {
     if (!t) { let alive = mapState.mobs.filter(m => m && m.curHp > 0); if (!alive.length) return; t = alive[Math.floor(Math.random() * alive.length)]; }
     if (!t.st) t.st = newMobStatus();
     let _pd = Math.max(1, Math.floor(roll(pp.dmg[0], pp.dmg[1]) * (finalMult || 1)));   // 🔧 武器強化 +1~+20 最終倍率：固定中毒 DoT 也吃（由呼叫端傳入施法者武器倍率）
+    let wasActive = t.st.poison > 0, priorUnit = wasActive ? (t.st.poisonUnit || 0) : 0;
     // ⚠️ 只延長、不縮短：黑暗妖精「附加劇毒」是 1 秒一跳，武器 proc 預設 3 秒一跳。
     //    原本無條件覆寫會把 1 秒節奏降成 3 秒（poisonUnit 有 max 保護但節奏沒有），
     //    再被 js/06 的「已中毒不重複套用」閘鎖住整個 proc 期間 → 持續毒 DPS 掉到約 1/3。
-    t.st.poison = Math.max(t.st.poison || 0, (pp.dur || 15) * 10);
-    t.st.poisonTick = Math.min(t.st.poisonTick || 999, (pp.tick || 3) * 10);
-    t.st.poisonStacks = Math.max(1, t.st.poisonStacks || 0);
-    t.st.poisonUnit = Math.max(t.st.poisonUnit || 0, _pd);
+    t.st.poison = Math.max(wasActive ? t.st.poison : 0, (pp.dur || 15) * 10);
+    t.st.poisonTick = wasActive ? Math.min(t.st.poisonTick || 999, (pp.tick || 3) * 10) : (pp.tick || 3) * 10;
+    t.st.poisonStacks = wasActive ? Math.max(1, t.st.poisonStacks || 0) : 1;
+    t.st.poisonUnit = Math.max(priorUnit, _pd);
     t.st.poisonDmg = t.st.poisonUnit * t.st.poisonStacks;
-    t.st.poisonSrc = src || 'player';   // 🎯 DPS：武器毒咒 DoT 施加者（玩家路徑不傳→'player'）
+    if (!wasActive || _pd >= priorUnit || !t.st.poisonSrc) t.st.poisonSrc = src || 'player';   // 弱毒只刷新時間，不能把既有強毒傷害歸到自己；過期後重新計算節奏與來源。
     mobWake(t);
     // 🔧 死亡之指毒咒：不再輸出「敵人中毒」套用訊息（只保留每秒中毒傷害日誌）
 }
@@ -748,11 +749,13 @@ function procFreeMagicSkill(t, skId, en, areaHit, sourceItem, illusionRecoverMp)
     if (total > 0) total = Math.max(1, Math.floor(total * equipSkillDmgMult(sk, skId)));   // 🏺 遺物 特定技能傷害倍率（觸發路徑：冰之女王魔杖觸發的冰錐等亦吃暴走兔胡蘿蔔 ×1.5）
     if (total > 0) total = illusionMagicDmg(total, true, illusionRecoverMp !== false);   // 🔮 全體免費施法只在第一個目標回MP；5件仍逐目標生效
     if (total > 0) {
-        t.curHp -= total; if (typeof terrorVisageOnDamage === 'function') terrorVisageOnDamage(t, total, 'magic'); t.justHit = (sk.ele && sk.ele !== 'none') ? sk.ele : 'magic'; t._spellHurt = true; mobWake(t);   // 🎬 v3.0.14 法術傷害→hurt(含頭目)；🌅 巨大骷髏：免費觸發法術視為魔法
+        t.curHp -= total;
+        let blocked = typeof terrorVisageOnDamage === 'function' && terrorVisageOnDamage(t, total, 'magic');
+        t.justHit = (sk.ele && sk.ele !== 'none') ? sk.ele : 'magic'; t._spellHurt = true; mobWake(t);   // 🎬 v3.0.14 法術傷害→hurt(含頭目)；🌅 巨大骷髏：免費觸發法術視為魔法
         if(typeof playSpellFx === 'function') { try { playSpellFx(sk.n, t); } catch(e){} }   // ⚡ v2.7.16 娃娃/寵物免費施放(如娃娃克特/聖伯納→極道落雷)也疊法術特效
         if (t.st && t.st.mrhalf > 0) t.st.mrhalf = 0;
         logCombat(`<span class="font-bold" style="color:#93c5fd;text-shadow:0 0 6px #2563eb;">【${sk.n}】</span>額外施放，對 <span class="${getMobColor(t.lv)}">${t.n}</span> 造成 <span class="${isCrit ? 'text-yellow-500 font-bold' : 'text-cyan-300'}">${total}</span> 點傷害${isCrit ? '（爆擊!）' : ''}。`, 'player-special');
-        if (sk.lifesteal) { let _h = Math.min(total, player.mhp - player.hp); if (_h > 0) { player.hp += _h; logCombat(`你吸取了 ${_h} 點生命。`, 'heal'); } }   // 🩸 v3.2.43 稽核修：吸血法術（冷徹寒顫等）proc 觸發也回血（比照 castSkill js/07:703·奪魂者雙刃劍 onHitCastSkill）
+        if (sk.lifesteal && !blocked && !player.dead) { let _h = Math.min(total, player.mhp - player.hp); if (_h > 0) { player.hp += _h; logCombat(`你吸取了 ${_h} 點生命。`, 'heal'); } }   // 吸血須造成傷害；完全免疫時不會憑空回血。
     }
     if (t.curHp > 0 && sk.freeze) applyMobStatus(t, { kind: 'freeze', pbase: sk.freeze, dur: 6 }, sk.n);
     if (t.curHp > 0 && sk.status) applyMobStatus(t, sk.status, sk.n, spCoef);
@@ -822,11 +825,14 @@ function antHelperDrMult() { return 1 - Math.min(20, player._antHelperDr || 0) /
 function dotMpRefundAmount(damage, percent) {
     return Math.max(1, Math.floor(damage * percent / 100));
 }
-// 🏺 v3.7.52 受困幽魂的淚滴（dotMpRefund）：因持續傷害損失 HP 時，恢復損失 HP N% 量的 MP（玩家/傭兵共用·掃全裝備欄取最大值）
+// 🏺 持續傷害回魔：重算時已取全裝備最大值；尚未重算的舊角色才走原本的裝備查詢。
 function dotMpRefundTo(entity, dmg) {
     if (!entity || !entity.eq || !(dmg > 0)) return;
-    let pct = 0;
-    for (let k in entity.eq) { let e = entity.eq[k]; if (!e) continue; let dd = DB.items[e.id]; if (dd && dd.dotMpRefund) pct = Math.max(pct, dd.dotMpRefund); }
+    let pct = entity.d && entity.d.dotMpRefund;
+    if (!Number.isFinite(pct)) {
+        pct = 0;
+        for (let k in entity.eq) { let e = entity.eq[k]; if (!e) continue; let dd = DB.items[e.id]; if (dd && dd.dotMpRefund) pct = Math.max(pct, dd.dotMpRefund); }
+    }
     if (!pct) return;
     let _mp = dotMpRefundAmount(dmg, pct);
     if (entity === player) player.mp = Math.min(player.mmp || 0, (player.mp || 0) + _mp);
@@ -1070,20 +1076,29 @@ function mobRageDmgMult(mob) {
 //  玩家「中招」無統一入口（狀態賦值散落 applyMobMagic 各分支＋enemyPhysicalAttack 的暈眩/onHitPoison）→ 用「進入前快照 / 離開後比對」包裝兩個函式：
 //  快照記下當下 >0 的狀態鍵，函式跑完後出現「新轉正的鍵」＝本次中招 → 恢復裝備上 statusHealHp 總和（一次中招只觸發一次；刷新既有狀態不觸發）。
 let _statusHealDepth = 0;   // 🌅 審查修：巢狀 wrapper 守衛——applyMobMagic(extra_attack 等) 內層又呼叫被包裝的 enemyPhysicalAttack 時，只有最外層比對補血（防一次中招 +50×2）
+function equippedStatusHealAmount(entity) {
+    if (!entity) return 0;
+    if (entity.d && Number.isFinite(entity.d.statusHealHp)) return entity.d.statusHealHp;
+    let heal = 0;
+    if (entity.eq) for (let k in entity.eq) { let it = entity.eq[k], def = it && DB.items[it.id]; if (def && def.statusHealHp) heal += def.statusHealHp; }
+    return heal;
+}
+function statusHealTimerKey(key) {
+    return !/(?:Dmg|Tick)$/.test(key) && key !== 'armorBreakPct' && key !== 'blindVal';
+}
 function _playerStatusSnap() {
-    if (!player || !player.statuses) return null;
-    let s = {}; for (let k in player.statuses) if (player.statuses[k] > 0) s[k] = 1;
+    if (!player || !player.statuses || !(equippedStatusHealAmount(player) > 0)) return null;
+    let s = {}; for (let k in player.statuses) if (statusHealTimerKey(k) && player.statuses[k] > 0) s[k] = 1;
     return s;
 }
 function _statusInflictHeal(beforeKeys) {
     if (!beforeKeys || !player || !player.statuses || player.dead) return;
-    let heal = 0;
-    if (player.eq) for (let k in player.eq) { let it = player.eq[k]; if (!it || !it.id) continue; let d0 = DB.items[it.id]; if (d0 && d0.statusHealHp) heal += d0.statusHealHp; }
+    let heal = equippedStatusHealAmount(player);
     if (!heal) return;
     for (let k in player.statuses) {
-        if (player.statuses[k] > 0 && !beforeKeys[k]) {
+        if (statusHealTimerKey(k) && player.statuses[k] > 0 && !beforeKeys[k]) {
             player.hp = Math.min(player.mhp, player.hp + heal);
-            logCombat(`<span class="text-emerald-300 font-bold">【牛鬼之子的黑戒】</span>異常狀態激發生機，恢復了 ${heal} 點 HP。`, 'heal');
+            logCombat(`<span class="text-emerald-300 font-bold">【異常回復】</span>異常狀態激發生機，恢復了 ${heal} 點 HP。`, 'heal');
             return;
         }
     }
@@ -1164,7 +1179,7 @@ function _enemyPhysicalAttackInner(mob, idx, stunChance = 0, atkDmg = null, atkD
         // 🏺 v3.1.77 稽核中#9 火熱愛意：火屬性怪物的一般攻擊也免疫（原僅攔火法術·與魔法路徑共用 10 秒節流 _fireNullCd；灼燒等持續傷害不在免疫範圍）
         if (mob.e === 'fire' && player.d.fireNullify && state.ticks >= (player._fireNullCd || 0)) {
             player._fireNullCd = state.ticks + 100;
-            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火熱愛意】</span>你化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性攻擊。`, 'magic');
+            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火焰化解】</span>你化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性攻擊。`, 'magic');
             return;
         }
         let diceCount = (atkDmg ? atkDmg[0] : mob.dmg[0]) || 1;
@@ -1300,26 +1315,26 @@ function _enemyPhysicalAttackInner(mob, idx, stunChance = 0, atkDmg = null, atkD
             let _rf = Math.max(1, Math.floor(totalDmg * fragileMult(mob)));
             mob.curHp -= _rf; mob.justHit = 'magic'; mobWake(mob);
             logCombat(`<span class="font-bold" style="color:#f472b6;text-shadow:0 0 6px #ec4899;">【疼痛的歡愉】</span>痛楚化為反擊，對 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 造成 ${_rf} 點傷害。`, 'magic');
-            if(mob.curHp <= 0) { killMob(idx); if(player.hp <= 0) killPlayer(); return; }   // 🔧 同歸於盡：反擊殺死敵人時仍須結算玩家死亡（否則殘血<=0卻未死、被回血復活）
+            if(mob.curHp <= 0) { killMob(idx); _relicOnDamageHeal(); if(player.hp <= 0) killPlayer(); return; }   // 反傷擊殺仍須完成同次受擊自癒，再判定玩家死亡；正常流程的回血時序不變。
         }
         if(player.buffs.sk_dragon_deadlybody > 0 && mob && mob.curHp > 0 && totalDmg > 0 && Math.random() < 0.23) {   // 🐉 致命身軀：受到攻擊時 23% 機率反射相同傷害
             let _rf = Math.max(1, Math.floor(totalDmg * fragileMult(mob)));
             mob.curHp -= _rf; mob.justHit = 'magic'; mobWake(mob);
             logCombat(`<span class="font-bold" style="color:#fbbf24;text-shadow:0 0 6px #d97706;">【致命身軀】</span>反射相同傷害，對 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 造成 ${_rf} 點傷害。`, 'magic');
-            if(mob.curHp <= 0) { killMob(idx); if(player.hp <= 0) killPlayer(); return; }
+            if(mob.curHp <= 0) { killMob(idx); _relicOnDamageHeal(); if(player.hp <= 0) killPlayer(); return; }
         }
         if(player.skills.includes('sk_warrior_titan_rock') && player.hp < player.mhp * titanThreshold() && mob && mob.curHp > 0 && totalDmg > 0) {   // ⚔️ 泰坦：岩石：HP<40%(反彈精通 80%) 受一般攻擊反射相同傷害
             let _tr = Math.max(1, Math.floor(totalDmg * fragileMult(mob)));
             mob.curHp -= _tr; mob.justHit = 'magic'; mobWake(mob);
             logCombat(`<span class="font-bold" style="color:#d6d3d1;text-shadow:0 0 6px #78716c;">【泰坦：岩石】</span>反射相同傷害，對 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 造成 ${_tr} 點傷害。`, 'magic');
-            if(mob.curHp <= 0) { killMob(idx); if(player.hp <= 0) killPlayer(); return; }
+            if(mob.curHp <= 0) { killMob(idx); _relicOnDamageHeal(); if(player.hp <= 0) killPlayer(); return; }
             if(hasMastery('k_rebound')) reboundExtraAttack(mob);   // 🏅 反彈精通：觸發忍耐被動→額外普攻
         }
         if(player.d.thornsDmg > 0 && mob && mob.curHp > 0 && totalDmg > 0) {   // 🦔 遺物 犰狳尖刺頭盔：受擊時對攻擊者造成固定反傷（不乘脆弱·固定值）
             let _th = player.d.thornsDmg;
             mob.curHp -= _th; mob.justHit = 'magic'; mobWake(mob);
             logCombat(`<span class="font-bold" style="color:#a3a3a3;">【尖刺】</span>尖刺回擊，對 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 造成 ${_th} 點傷害。`, 'magic');
-            if(mob.curHp <= 0) { killMob(idx); if(player.hp <= 0) killPlayer(); return; }
+            if(mob.curHp <= 0) { killMob(idx); _relicOnDamageHeal(); if(player.hp <= 0) killPlayer(); return; }
         }
         if(player.d.hurtExplode > 0 && totalDmg > 0) { bombFlowerExplode(); if(player.hp <= 0) { killPlayer(); return; } }   // 💥 遺物 爆彈花蕊：受物理傷害時爆裂（自傷可致死→補死亡結算）
         if(totalDmg > 0) _relicOnDamageHeal();   // 🏺 遺物 白螞蟻蛋殼：受擊自癒（5 秒節流·可救回 <=0 血）
@@ -1375,9 +1390,13 @@ function _enemyPhysicalAttackInner(mob, idx, stunChance = 0, atkDmg = null, atkD
 function mercAggroWeight(c) {
     if (!c) return 0;
     // 🫥 v3.7.88 隱身斗篷(aggroMin)：被攻擊權重**必定為 1**（最低）——先於一切分支判定，職業/武器/其他裝備的 aggroWeight 一律不再計入。
-    if (c.eq) for (let k in c.eq) { let e = c.eq[k]; if (e) { let d = DB.items[e.id]; if (d && d.aggroMin) return 1; } }
     let _agB = 0;   // 🐍 艾庫卡伊拉的華麗兜帽：裝備 aggroWeight → 提高被攻擊權重（玩家/傭兵通用）
-    if (c.eq) for (let k in c.eq) { let e = c.eq[k]; if (e) { let d = DB.items[e.id]; if (d && d.aggroWeight) _agB += d.aggroWeight; } }
+    if (c.eq) for (let k in c.eq) {
+        let e = c.eq[k], d = e && DB.items[e.id];
+        if (!d) continue;
+        if (d.aggroMin) return 1;   // 即使前面的裝備已有加成，斗篷仍覆蓋全部權重。
+        if (d.aggroWeight) _agB += d.aggroWeight;
+    }
     if (c.cls === 'mage' || c.cls === 'illusion') return 1 + _agB;   // 施法者：恆 1
     let w = (c.eq && c.eq.wpn) ? DB.items[c.eq.wpn.id] : null;
     if (w && (w.isBow || w.ranged)) return 1 + _agB;   // 持弓/遠程：恆 1（弓・十字弓）
@@ -1538,7 +1557,7 @@ function _enemyAttackAllyInner(mob, ally, isBasicAttack = false) {
     // 🏺 v3.2.40 稽核修 火熱愛意（傭兵鏡像·物理）：火屬性怪物的一般攻擊免疫·每傭兵獨立 10 秒節流（鏡像玩家 js/04:797·同批 wearerEle 已有鏡像唯此欄漏接）
     if (mob.e === 'fire' && d.fireNullify && state.ticks >= (ally._fireNullCd || 0)) {
         ally._fireNullCd = state.ticks + 100;
-        logCombat(`<span class="font-bold" style="color:#fca5a5;">【火熱愛意】</span>協力·${ally._allyName} 化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性攻擊。`, 'magic');
+        logCombat(`<span class="font-bold" style="color:#fca5a5;">【火焰化解】</span>協力·${ally._allyName} 化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性攻擊。`, 'magic');
         return;
     }
     let dc = (mob.dmg && mob.dmg[0]) || 1, ds = (mob.dmg && mob.dmg[1]) || 1;
@@ -1867,19 +1886,18 @@ function castMobMagic(mob, sk) {
 // 🏺 statusHealHp（牛鬼之子的黑戒·傭兵鏡像）：與玩家 _playerStatusSnap/_statusInflictHeal 同型——
 //    比對「本次是否有新轉正的異常狀態鍵」，有就依傭兵自身裝備的 statusHealHp 總和補血。逐傭兵獨立 depth。
 function _allyStatusSnap(ally) {
-    if (!ally || !ally.statuses) return null;
-    let s = {}; for (let k in ally.statuses) if (ally.statuses[k] > 0) s[k] = 1;
+    if (!ally || !ally.statuses || !(equippedStatusHealAmount(ally) > 0)) return null;
+    let s = {}; for (let k in ally.statuses) if (statusHealTimerKey(k) && ally.statuses[k] > 0) s[k] = 1;
     return s;
 }
 function _allyStatusInflictHeal(ally, beforeKeys) {
     if (!beforeKeys || !ally || !ally.statuses || ally._downed) return;
-    let heal = 0;
-    if (ally.eq) for (let k in ally.eq) { let it = ally.eq[k]; if (!it || !it.id) continue; let d0 = DB.items[it.id]; if (d0 && d0.statusHealHp) heal += d0.statusHealHp; }
+    let heal = equippedStatusHealAmount(ally);
     if (!heal) return;
     for (let k in ally.statuses) {
-        if (ally.statuses[k] > 0 && !beforeKeys[k]) {
+        if (statusHealTimerKey(k) && ally.statuses[k] > 0 && !beforeKeys[k]) {
             ally.curHp = Math.min(ally.mhp || 1, (ally.curHp || 0) + heal);
-            logCombat(`<span class="text-emerald-300 font-bold">【牛鬼之子的黑戒】</span>協力·${ally._allyName} 因異常狀態激發生機，恢復了 ${heal} 點 HP。`, 'heal', 'mercenary');
+            logCombat(`<span class="text-emerald-300 font-bold">【異常回復】</span>協力·${ally._allyName} 因異常狀態激發生機，恢復了 ${heal} 點 HP。`, 'heal', 'mercenary');
             return;
         }
     }
@@ -1974,7 +1992,7 @@ function _applyMobMagicToAllyInner(mob, sk, ally) {
         // 🏺 v3.2.40 稽核修 火熱愛意（傭兵鏡像·魔法）：免疫火屬性法術·與物理路徑共用每傭兵 10 秒節流（鏡像玩家 js/04:1523）
         if (sk.ele === 'fire' && d.fireNullify && state.ticks >= (ally._fireNullCd || 0)) {
             ally._fireNullCd = state.ticks + 100;
-            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火熱愛意】</span>協力·${ally._allyName} 化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性傷害。`, 'magic');
+            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火焰化解】</span>協力·${ally._allyName} 化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性傷害。`, 'magic');
             return;
         }
         let dmg = sk.fixedDmg ? (baseM + extra) : (Math.floor(Math.floor((baseM + extra) * resF) * mrMult(mr)) - (d.dr || 0));
@@ -2385,7 +2403,7 @@ function _applyMobMagicInner(mob, sk) {
         // 🏺 遺物 火熱愛意：免疫受到的火屬性傷害（每 10 秒最多觸發 1 次·player._fireNullCd 節流）
         if (sk.ele === 'fire' && player.d.fireNullify && state.ticks >= (player._fireNullCd || 0)) {
             player._fireNullCd = state.ticks + 100;   // 10 秒（100 ticks）節流
-            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火熱愛意】</span>你化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性傷害。`, 'magic');
+            logCombat(`<span class="font-bold" style="color:#fca5a5;">【火焰化解】</span>你化解了 <span class="${getMobColor(mob.lv)}">${mob.n}</span> 的火屬性傷害。`, 'magic');
             return;
         }
 

@@ -230,7 +230,7 @@ function gameLoop() {
     }
 
     // ⏩ 補跑路徑（v3.6.95 重建 v3.2.78 時間預算榨乾制）：每次呼叫最多吃 FF_BUDGET_MS 計算時間就讓步，
-    //    未還完的債留待下次呼叫（每 4 tick 量一次 performance.now·FF_HARD_CAP 保底防單次過量）。
+    //    未還完的債留待下次呼叫（每 tick 檢查時間·FF_HARD_CAP 保底防單次過量）。
     //    state.ff＝全域補跑閘（VFX/動畫/音效/日誌/逐次重繪與存檔全部受抑制）；ffSmall 保留相容但固定 false。
     if (!_ffAcc) {
         if (typeof resetCatchupGainItemIndex === 'function') resetCatchupGainItemIndex();
@@ -271,10 +271,8 @@ function gameLoop() {
             }
             if (player.dead) break;   // 真實補跑戰敗即停止；死亡後的背景時間不得繼續產生收益
             _ffErrorStreak = 0;
-            if ((ran & 3) === 0) {
-                let t = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-                if (t - budget0 >= FF_BUDGET_MS) break;
-            }
+            let t = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+            if (t - budget0 >= FF_BUDGET_MS) break;
         }
     } finally {
         _tickDebt = Math.max(0, _tickDebt - ran * TICK_MS);
@@ -307,11 +305,9 @@ function _ffFinishCatchup() {
         flushTickRender();
     }
     let _needsSave = _longCatchup || _deferredSave || _acc.failed;
-    let _saveOk = false;
     if (_needsSave) {
-        try { _saveOk = saveGame() === true; } catch (e) {}
+        try { saveGame(); } catch (e) {}
     }
-    // 🗑️ v3.7.94 移除 offlineCatchupSaveCommitted 呼叫：那是 js/27 離線掛機的「待結算補跑憑證」提交點，整套已刪除。
     if (_longCatchup) {
         try {
             let _gd = (player.gold || 0) - _acc.gold;
@@ -340,8 +336,8 @@ function _ffFinishCatchup() {
     _ffErrorStreak = 0;
     _ffProgressHide();
 }
-// ⏩ 補跑專用快速排程：每批最多運算 80ms、讓出 8ms 後續跑；仍逐 tick 真實結算。
-const FF_BUDGET_MS = 80;
+// ⏩ 每 tick 後檢查 12ms 預算，讓出 8ms 供輸入與畫面更新；收益仍逐 tick 真實結算。
+const FF_BUDGET_MS = 12;
 const FF_YIELD_MS = 8;
 const FF_HARD_CAP = 6000;
 const FF_MAX_ELAPSED_MS = 300000;
@@ -475,7 +471,8 @@ function inAbsBarrier() { return !!(player.buffs && player.buffs.sk_abs_barrier 
 // 🚀 重繪合併：tick 進行中(state.inTick)時 updateUI/renderMobs 只標記 dirty，於 tick 結尾 flushTickRender() 統一重繪一次，
 //   避免單一 tick 內(玩家＋多傭兵＋持續傷害＋特效＋擊殺)重複重繪十數次；tick 外(點擊/裝備/用道具/開面板)維持立即重繪、體感不變。
 let _uiDirty = false, _mobsDirty = false;
-function updateUI() { if (state.inTick || (typeof catchupActive === 'function' && catchupActive())) { _uiDirty = true; return; } _uiDirty = false; _updateUIImpl(); }
+function updateUI() {
+    if (typeof _deferItemTransactionEffect === 'function' && _deferItemTransactionEffect(updateUI, arguments)) return; if (state.inTick || (typeof catchupActive === 'function' && catchupActive())) { _uiDirty = true; return; } _uiDirty = false; _updateUIImpl(); }
 function renderMobs() { if (state.inTick || (typeof catchupActive === 'function' && catchupActive())) { _mobsDirty = true; return; } _mobsDirty = false; _renderMobsImpl(); }
 function flushTickRender() { if (typeof catchupActive === 'function' && catchupActive()) return; if (_uiDirty) { _uiDirty = false; _updateUIImpl(); } if (_mobsDirty) { _mobsDirty = false; _renderMobsImpl(); } }
 // 🚀 怪物卡互動穩定：① 滑鼠所在怪的 uid 以 JS 追蹤(_hoverMobUid)、每次重繪都重新套用「顯示名字」class→避免重繪(每 tick 換掉 #mob-list 內容)使 :hover 瞬間失效造成名字一直閃；② 按住怪物卡期間(_mobPointerDown)延後重繪→避免 mousedown↔mouseup 之間整列被換掉使點擊切換目標失效。
@@ -2446,6 +2443,16 @@ function consumeArrow() {
 
 // ===== 法杖共鳴：裝備指定魔法杖時，一般攻擊(不論命中與否)有 智力/60 機率免費施展光箭 =====
 const WAND_LIGHTARROW_IDS = ['wpn_oakwand', 'wpn_38', 'wpn_witchwand', 'wpn_manawand', 'wpn_crystalwand', 'wpn_baless', 'wpn_wand_rasta', 'wpn_red_crystalwand', 'wpn_laia_wand', 'wpn_icequeen_wand', 'wpn_demon_scythe', 'wpn_darkmage_wand', 'wpn_baphomet_wand', 'wpn_illu_wand', 'wpn_demon_wand_hidden', 'wpn_dark_crystalball', 'wpn_steel_manawand_blue', 'relic_amp_staff', 'relic_elder_thunder', 'relic_cerberus_wand', 'relic_evillizard_eye', 'relic_lightbeam_wand', 'relic_warlock_grimoire', 'relic_windking_roar', 'relic_rockmage_secret', 'wpn_onmyoji_fan', 'relic_sr_kyuubi_wand', 'relic_water_orb', 'relic_unsealed_baphomet_wand', 'wpn_angel_wand'];   // 😇 v3.7.74 天使魔杖亦共鳴   // 🏺 v3.7.20 解除封印的巴風特魔杖亦共鳴   // 🏺 v3.5.27 水靈的魔力珠亦共鳴（一般限定＝wandLightArrowProc 開頭 classicMode 早退）   // 🌅 日出之國：陰陽師的扇子（傳說）＋九尾妖狐的怒火（遺物）亦共鳴   // 🏺 遺物 安普長老的拐杖／長老的雷電能量／三頭犬魔杖／邪惡蜥蜴的眼瞳／光束強化魔杖／風精靈王的狂嘯／破岩法師的秘術亦共鳴 // 🔮 幻術士魔杖：共鳴（👹 隱藏的魔族魔杖亦共鳴；🏴‍☠️ 漆黑水晶球亦共鳴）   // 🏅 共鳴：含蕾雅魔杖／冰之女王魔杖／惡魔鐮刀／黑法師之杖／🔧巴風特魔杖（👑惡魔王魔杖已改為魔爆 eff:magicburst）
+// 固定遺物變體沿用原型的共鳴資格，讓玩家、傭兵與資訊欄共用同一份 ID 清單。
+(function inheritRelicWandResonance() {
+    let original = new Set(WAND_LIGHTARROW_IDS);
+    for (let id in DB.items) {
+        let d = DB.items[id], baseId = d && d.relicBaseId;
+        let base = typeof baseId === 'string' && DB.items[baseId];
+        if (base && !base.relic && base.relicBaseId === undefined && base.type === 'wpn'
+            && original.has(baseId) && !original.has(id)) WAND_LIGHTARROW_IDS.push(id);
+    }
+})();
 function wandLightArrowProc(target) {
     if (player.classicMode) return;   // 🎮 經典模式：停用共鳴
     let wpn = player.eq.wpn;
@@ -2822,7 +2829,13 @@ function dualWieldOffhandAttack(t) {
     let owpn = DB.items[player.eq.offwpn.id];
     let dice = owpn ? (t.s === 'L' ? owpn.dmgL : owpn.dmgS) : 2;
     let res = getPhysicalDmg(dice, t, owpn, null, false, false, false, false, player.eq.offwpn);   // 副手獨立命中判定（可未命中）；傳入副手實例→屬性詞綴用副手自身（祝福/遠古已於 recompute 計入 global d）
-    if (!res.hit) { if (typeof vfxMiss === 'function') vfxMiss(t); logCombat(`<span class="font-bold" style="color:#fbbf24;">【迅猛雙斧】</span>副手追擊 <span class="${getMobColor(t.lv)}">${t.n}</span> 未命中。`, 'miss'); return; }
+    if (!res.hit) {
+        if (typeof vfxMiss === 'function') vfxMiss(t);
+        logCombat(`<span class="font-bold" style="color:#fbbf24;">【迅猛雙斧】</span>副手追擊 <span class="${getMobColor(t.lv)}">${t.n}</span> 未命中。`, 'miss');
+        // 新遺物的攻擊觸發不要求命中；指定副手避免重複判定娃娃，舊武器維持原頻率。
+        if (owpn && owpn.relicBaseId && typeof weaponSpellProc === 'function') weaponSpellProc(t, false, player.eq.offwpn);
+        return;
+    }
     // ⚔️ v3.5.97 副手武器自身的即死 proc（比照主手 js/04 命中後先判即死→成功則不再跑一般扣血）
     if (typeof offhandInstakillProc === 'function' && offhandInstakillProc(player.eq.offwpn, owpn, t)) return;
     let dmg = res.dmg;
@@ -2926,7 +2939,14 @@ function manaMasteryRefund(spent) {
 }
 // 🔮 是否為魔杖/法杖類武器（沿用 js/10 同一套名稱判定，排除黃金權杖＝王族單手劍）：
 //    魔劍精通(i_magicsword)只把「非奇古獸的近戰武器」轉成奇古獸必中魔法路徑，魔杖本即施法武器、不應再轉（必中/攻速+30% 皆排除）。
-function isWandWeapon(d) { return !!(d && d.type === 'wpn' && (d.isWand || /魔杖|法杖/.test(d.n || '') || (/杖/.test(d.n || '') && !/權杖/.test(d.n || '')))); }   // 🔮 d.isWand：名稱非「杖」但實為單手魔杖者（惡魔鐮刀）顯式標記
+function isWandWeapon(d) {
+    if (d && d.relicBaseId !== undefined) {
+        let base = typeof d.relicBaseId === 'string' && DB.items[d.relicBaseId];
+        if (!base || base.relic || base.relicBaseId !== undefined) return false;
+        d = base;
+    }
+    return !!(d && d.type === 'wpn' && (d.isWand || /魔杖|法杖/.test(d.n || '') || (/杖/.test(d.n || '') && !/權杖/.test(d.n || ''))));
+}   // 🔮 d.isWand：名稱非「杖」但實為單手魔杖者（惡魔鐮刀）顯式標記
 // 💧 一般攻擊命中回 MP 的恢復量（單一真相·玩家/傭兵/tooltip 共用）：mpOnHitAmt 固定量最優先（邪惡蜥蜴的眼瞳 +6）；
 //    否則 = mpOnHitBase（預設 1·鋼鐵瑪那魔杖 2）＋ 突破安定值 6 之後每 +1 再多恢復 1。en 需先過 capWpnEn。
 function mpOnHitAmount(wpn, en) {

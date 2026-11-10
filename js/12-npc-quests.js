@@ -129,74 +129,116 @@ function whMatchFilter(id){
     if(_whFilter === 'armor' && _whSubFilter === 'tshirt') { let d = DB.items[id]; return !!(d && d.type === 'arm' && d.slot === 'tshirt'); }   // 🔧 v2.6.77 內衣子分類：依 slot 直接比對
     return (typeof equipCatKey === 'function') ? (equipCatKey(id, DB.items[id]) === _whSubFilter) : true;
 }
-// 🛡️ 倉庫資料安全網（防「不匯出匯入也會清空」）：
-//   _whLoadOk＝最近一次 loadWarehouse 是否成功解碼（桶存在卻解不開＝false → saveWarehouse 拒絕用空覆蓋，先把原始位元組備份）。
-//   _whLoadUids＝最近一次載入到的 uid 集合（多分頁加寫合併：寫入前比對，保留其他分頁在本快照之後新存入、而本次沒有的堆疊；本快照原有的 uid 不併→不會復活本次刻意取出的物品）。
-//   兩者由 loadWarehouse 設定、saveWarehouse 讀取；所有寫入者皆「同步 loadWarehouse→…→saveWarehouse」相鄰成對（saveGame 不碰倉庫），故旗標必對應同一次操作。
+// 倉庫數量只接受可無損解讀的資料；舊格式缺省 cnt=1，null/NaN 不可猜回原數量。
+function _warehouseNumber(value, fallback, integer) {
+    if (value === undefined) return fallback;
+    if ((typeof value !== 'number' && typeof value !== 'string') || (typeof value === 'string' && !value.trim()))
+        throw new Error('Invalid warehouse number');
+    let n = Number(value);
+    if (!Number.isFinite(n) || n < 0 || (integer && (!Number.isInteger(n) || n === 0))) throw new Error('Invalid warehouse number');
+    return n;
+}
+function normalizeWarehouseData(w) {
+    if (!w || typeof w !== 'object' || Array.isArray(w)) throw new Error('Invalid warehouse');
+    let source = w.items === undefined ? [] : w.items;
+    if (!Array.isArray(source)) throw new Error('Invalid warehouse items');
+    let items = source.map(it => {
+        if (!it || typeof it !== 'object' || Array.isArray(it) || typeof it.id !== 'string' || !it.id)
+            throw new Error('Invalid warehouse item');
+        return { ...it, cnt: _warehouseNumber(it.cnt, 1, true) };
+    });
+    return { ...w, items: items, gold: _warehouseNumber(w.gold, 0, false) };
+}
+
+// 快照綁定讀出的物件，避免其他唯讀呼叫覆蓋全域載入旗標後，對錯一筆交易。
+// 寫入前比對解碼後內容，連同一 uid 的數量與金幣更新也不能被舊快照覆蓋。
+// 此為衝突偵測與失敗回滾，不是跨分頁鎖；比對到寫入之間及兩個儲存鍵仍非原子操作。
 let _whLoadOk = true;
 let _whLoadUids = null;
-// 🪦 v3.2.70 倉庫領出墓碑（多分頁防復活＝防複製）：物品被移出倉庫（領出/製作消耗/兌換/清孤兒）成功寫入後，uid 記入 whKey()+'_rm'。
-//   實測重現的複製路徑：分頁B 先載入快照（含物品X）→ 分頁A 領出X（桶已移除·X進A背包）→ B 拿舊快照做任何倉庫寫入 → X 被寫回倉庫＝背包+倉庫各一份。
-//   安全網 B 只防「新增遺失」防不了「移除復活」→ 墓碑補上：寫入/讀取時把「快照殘留的墓碑 uid」丟棄；
-//   合法回歸（領出後又存回同 uid＝本次新增·不在 _whLoadUids）→ 解除墓碑並保留，不會誤刪。上限 400 筆淘汰最舊（uid=隨機9碼不重用）。
-function _whTombsRead(){ try { let raw = _lzGet(whKey() + '_rm'); if (raw == null || raw === '') return {}; let o = JSON.parse(raw); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; } catch(e){ return {}; } }
-function _whTombsWrite(t){ try { let ks = Object.keys(t); if (ks.length > 400) ks.slice(0, ks.length - 400).forEach(k => delete t[k]); _lzSet(whKey() + '_rm', JSON.stringify(t)); } catch(e){} }
+const _whSnapshots = new WeakMap();
+let _whLastSnapshot = null;
+function _whParseTombs(raw) {
+    if (raw == null) return {};
+    let o = JSON.parse(raw);
+    if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('Invalid warehouse tombstones');
+    return o;
+}
+function _whTombsWrite(t){
+    try {
+        let ks = Object.keys(t);
+        if (ks.length > 400) ks.slice(0, ks.length - 400).forEach(k => delete t[k]);
+        return _lzSet(whKey() + '_rm', JSON.stringify(t)) === true;
+    } catch(e){ return false; }
+}
 function loadWarehouse(){
     _whLoadOk = true; _whLoadUids = null;
     let key = whKey();
-    let raw;
-    try { raw = _lsGet(key); } catch(e){ _whLoadOk = false; return { items: [], gold: 0 }; }   // 🖥️ 必須走 _lsGet（打包版＝檔案存檔 _FS）；用 localStorage.getItem 在打包版永遠讀到 null→倉庫被當成空的→存入物品/金幣消失
-    if(raw == null){ _whLoadUids = new Set(); return { items: [], gold: 0 }; }   // 真正不存在＝空倉庫（正常·非失敗）
     try {
-        let s = _lzGet(key);
-        if(s == null || s === ''){ _whLoadOk = false; return { items: [], gold: 0 }; }   // 桶存在但解壓失敗→不可當成空倉庫
-        let w = JSON.parse(s);
-        let items = w.items || [];
-        try { let tombs = _whTombsRead(); items = items.filter(it => !(it && it.uid != null && tombs[it.uid])); } catch(e){}   // 🪦 墓碑 uid＝已被領出（他分頁復活殘留）→ 隱藏；下次任一寫入時自桶清除
-        _whLoadUids = new Set(items.map(it => it && it.uid).filter(u => u != null));
-        return { items: items, gold: w.gold || 0 };
-    } catch(e){ _whLoadOk = false; return { items: [], gold: 0 }; }   // JSON 毀損→不可當成空倉庫
+        let value = _lzGetStrict(key), tombValue = _lzGetStrict(key + '_rm');
+        let w = normalizeWarehouseData(value == null ? { items: [], gold: 0 } : JSON.parse(value));
+        let tombs = _whParseTombs(tombValue);
+        w.items = w.items.filter(it => !(it.uid != null && tombs[it.uid]));
+        _whLoadUids = new Set(w.items.map(it => it.uid).filter(u => u != null));
+        _whLastSnapshot = { ok: true, key: key, value: value, tombValue: tombValue, uids: _whLoadUids };
+        _whSnapshots.set(w, _whLastSnapshot);
+        return w;
+    } catch(e){
+        _whLoadOk = false;
+        let w = { items: [], gold: 0 };
+        _whLastSnapshot = { ok: false, key: key };
+        _whSnapshots.set(w, _whLastSnapshot);
+        return w;
+    }
 }
 function saveWarehouse(w){
     let key = whKey();
-    // 安全網 A：上一次讀取失敗（桶存在卻解不開）→ 絕不用可能是空的資料覆蓋還救得回的位元組；先一次性備份原始值再拒寫並警告。
-    if(_whLoadOk === false){
-        try { let raw = _lsGet(key); if(raw != null && _lsGet(key + '_bak') == null) _lsSet(key + '_bak', raw); } catch(e){}   // 🖥️ 備份也走 _lsGet/_lsSet（打包版檔案存檔）
-        if(typeof logSys === 'function') logSys('<span class="text-red-400 font-bold">⚠ 倉庫資料讀取失敗，已暫停寫入以免覆蓋遺失（原始資料已備份至 ' + key + '_bak）。請重新整理頁面後再操作倉庫。</span>');
+    // 潘朵拉失敗回滾使用獨立深複本，並在回寫前重讀倉庫；此時沿用剛讀出的快照。
+    let snapshot = (w && _whSnapshots.get(w)) || _whLastSnapshot;
+    if(!snapshot || !snapshot.ok || snapshot.key !== key){
+        try { let raw = _lsGetStrict(key); if(raw != null && _lsGetStrict(key + '_bak') == null) _lzSetStoredRaw(key + '_bak', raw); } catch(e){}
+        if(typeof logSys === 'function') logSys('<span class="text-red-400 font-bold">⚠ 倉庫資料無法安全讀取，已暫停寫入。請先排除儲存問題再操作倉庫。</span>');
         return false;
     }
-    let items = (w && w.items) || [];
-    // 🪦 墓碑過濾：快照殘留的墓碑 uid（他分頁已領出）→ 丟棄防復活；本次新增（不在 _whLoadUids＝剛存入的合法回歸）→ 解除墓碑並保留。
-    let tombs = _whTombsRead(); let tombsChanged = false;
     try {
-        items = items.filter(it => {
-            if (!(it && it.uid != null && tombs[it.uid])) return true;
-            if (!_whLoadUids || !_whLoadUids.has(it.uid)) { delete tombs[it.uid]; tombsChanged = true; return true; }   // 合法回歸（偏向保留＝防遺失）
-            return false;   // 快照殘留＝已被領出→不寫回
+        let normalized = normalizeWarehouseData(w);
+        let value = _lzGetStrict(key), tombValue = _lzGetStrict(key + '_rm');
+        if(value !== snapshot.value || tombValue !== snapshot.tombValue){
+            if(typeof logSys === 'function') logSys('<span class="text-amber-300">倉庫已由另一個操作更新，本次操作已取消；請重新操作。</span>');
+            return false;
+        }
+        let beforeRaw = _lsGetStrict(key), beforeTombRaw = _lsGetStrict(key + '_rm');
+        let tombs = _whParseTombs(tombValue), tombsChanged = false;
+        let items = normalized.items.filter(it => {
+            if (!(it.uid != null && tombs[it.uid])) return true;
+            if (!snapshot.uids.has(it.uid)) { delete tombs[it.uid]; tombsChanged = true; return true; }
+            return false;
         });
-    } catch(e){}
-    // 安全網 B（多分頁）：寫入前重讀桶現值，併入「其他分頁在本快照之後新存入、本快照沒見過且本次也沒寫」的堆疊（以 uid 比對·只增不減·偏向重複而非遺失）。🪦 墓碑 uid 跳過（桶內殘留的已領出物）。
-    try {
-        if(_whLoadUids){
-            let cs = _lzGet(key);
-            if(cs != null && cs !== ''){
-                let cur = JSON.parse(cs);
-                let haveUid = new Set(items.map(it => it && it.uid).filter(u => u != null));
-                (cur.items || []).forEach(it => { if(it && it.uid != null && !tombs[it.uid] && !_whLoadUids.has(it.uid) && !haveUid.has(it.uid)) items.push(it); });
-            }
+        let now = new Set(items.map(it => it.uid).filter(u => u != null));
+        snapshot.uids.forEach(u => { if (!now.has(u)) { tombs[u] = 1; tombsChanged = true; } });
+        let payload = JSON.stringify({ items: items, gold: normalized.gold });
+        if (!_lzSet(key, payload)) return false;
+        if (tombsChanged && !_whTombsWrite(tombs)) {
+            // 主桶與墓碑是兩個鍵；墓碑失敗不得回報成功，否則存回物品會被舊墓碑隱藏。
+            let restoreRaw = (restoreKey, raw) => {
+                try {
+                    if (raw == null) _lzRemoveStored(restoreKey);
+                    else if (!_lzSetStoredRaw(restoreKey, raw)) return false;
+                    return _lsGetStrict(restoreKey) === raw;
+                } catch(e) { return false; }
+            };
+            let tombsRestored = restoreRaw(key + '_rm', beforeTombRaw);
+            let restored = restoreRaw(key, beforeRaw);
+            if ((!restored || !tombsRestored) && typeof logSys === 'function')
+                logSys('<span class="text-red-400 font-bold">倉庫寫入及回復失敗，請停止操作並保留目前畫面。</span>');
+            return false;
         }
-    } catch(e){}
-    let ok = _lzSet(key, JSON.stringify({ items: items, gold: (w && w.gold) || 0 }));
-    // 🪦 成功寫入後：本次自倉庫移除的 uid（快照有、最終沒有）記入墓碑——涵蓋 領出/製作消耗/兌換/清孤兒 全部移除路徑，防其他分頁舊快照復活。
-    try {
-        if (ok && _whLoadUids) {
-            let now = new Set(items.map(it => it && it.uid).filter(u => u != null));
-            _whLoadUids.forEach(u => { if (!now.has(u)) { tombs[u] = 1; tombsChanged = true; } });
-        }
-        if (ok && tombsChanged) _whTombsWrite(tombs);
-    } catch(e){}
-    try { if (typeof _lkInvalidateWhCache === 'function') _lkInvalidateWhCache(); } catch(e){}   // ⚡ v3.5.89 倉庫已變 → 讓 js/14 的「鎖定件索引」快取立即失效（否則存/取後提示數字最多慢 0.5 秒）
-    return ok;
+        w.items = items; w.gold = normalized.gold;
+        _whLoadOk = true; _whLoadUids = now;
+        _whLastSnapshot = { ok: true, key: key, value: payload, tombValue: tombsChanged ? JSON.stringify(tombs) : tombValue, uids: now };
+        _whSnapshots.set(w, _whLastSnapshot);
+        try { if (typeof _lkInvalidateWhCache === 'function') _lkInvalidateWhCache(); } catch(e){}
+        return true;
+    } catch(e){ return false; }
 }
 // ===== 🎴🗡️ 共用收集圖鑑（卡片 cardDex／裝備 equipDex）：同模式角色共用，獨立於存檔位的 localStorage 鍵（概念同共用倉庫）=====
 const CARDDEX_KEY = 'lineage_idle_carddex';
@@ -358,7 +400,13 @@ if (typeof window !== 'undefined' && window.addEventListener) window.addEventLis
 // ⚠️ 巨靈願望戒指(gw)每只的三個願望各自獨立，而 itemSig 不含 gw → 必須顯式排除，
 //    否則存入/取出會把兩只不同願望的戒指併成一疊、其中一份願望資料就此消失。
 function _whStackFind(arr, it){ return (!it.gw) ? arr.find(x => !x.gw && sameItemSig(x, it)) : null; }
-function _whStackAbsorb(stack, src, n){ stack.cnt += n; if(src && src.lock){ stack.lock = true; stack.junk = false; } }   // 合併時保護狀態只會擴散、不會遺失
+function _whStackAbsorb(stack, src, n){
+    let amount = _warehouseNumber(n === undefined && src ? src.cnt : n, 1, true);
+    let total = _warehouseNumber(stack.cnt, 1, true) + amount;
+    if (!Number.isFinite(total) || !Number.isInteger(total)) throw new Error('Invalid warehouse stack total');
+    stack.cnt = total;
+    if(src && src.lock){ stack.lock = true; stack.junk = false; }
+}   // 缺省數量與數字字串皆先正規化；合併時保護狀態只會擴散。
 // 🗑️ 自動販賣暫態旗標不屬於倉庫（那是每次背包工作階段的狀態）。存入與取出都清掉，否則
 //    帶著早已過期 junkSince 的物品一回到背包就會被下一次 10 秒掃描直接賣掉＝零寬限期。
 //    取出時一併清，可順便治好既有存檔中已經帶著舊旗標躺在倉庫裡的物品。
@@ -406,8 +454,8 @@ function whOneClickDeposit(){
         let cur = player.inv[idx];
         let stack = _whStackFind(w.items, cur);
         if(!stack && w.items.length >= WH_MAX){ full = true; break; }
-        player.inv.splice(idx, 1);
         if(stack){ _whStackAbsorb(stack, cur, cur.cnt); } else { w.items.push(_whClearJunkState(cur)); whSigs.add(whSig(cur)); }
+        player.inv.splice(idx, 1);
         deposited++;
     }
     if(!whTxnCommit(w, _txn)){ renderTabs(true); updateUI(); renderWarehouseNPC(document.getElementById('interaction-content')); return; }
@@ -421,7 +469,7 @@ function sortWarehouse(){
     let w = loadWarehouse();
     if(!w.items.length){ logSys('<span class="text-slate-400">倉庫沒有物品可排列。</span>'); return; }
     w.items.sort(invSortCmp);
-    saveWarehouse(w);
+    if(!saveWarehouse(w)) return;
     logSys('<span class="text-cyan-300 font-bold">倉庫已重新排列。</span>');
     let el = document.getElementById('interaction-content'); if(el) renderWarehouseNPC(el);
 }
@@ -443,11 +491,11 @@ function whDeposit(uidv, qty){
     let stack = _whStackFind(w.items, it);
     if(!stack && w.items.length >= WH_MAX){ logSys(`<span class="text-red-400">倉庫已滿（上限 ${WH_MAX} 格）。</span>`); return; }
     if(qty >= total){          // 全部存入
-        player.inv.splice(idx, 1);
         if(stack) _whStackAbsorb(stack, it, total); else w.items.push(_whClearJunkState(it));
+        player.inv.splice(idx, 1);
     } else {                   // 部分存入：背包留下剩餘
-        it.cnt = total - qty;
         if(stack) _whStackAbsorb(stack, it, qty); else w.items.push(_whClearJunkState({ ...it, uid: uid(), cnt: qty }));
+        it.cnt = total - qty;
     }
     if(!whTxnCommit(w, _txn)){ renderTabs(true); updateUI(); renderWarehouseNPC(document.getElementById('interaction-content')); return; }
     renderTabs(true); updateUI();

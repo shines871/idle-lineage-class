@@ -960,6 +960,11 @@
             return changed ? {} : { commit: false, unchanged: true };
         });
         let latest = result.state || _readState();
+        // 已離場的叫賣者不再需要週期記錄，避免每次生成新 ID 都永久保留一筆。
+        let activeIds = new Set(latest.wanderers.filter(w => _wandererPresent(w, now)).map(w => w.id));
+        for (let id of Object.keys(_lastBroadcastCycles)) {
+            if (!activeIds.has(id)) delete _lastBroadcastCycles[id];
+        }
         let sig = _activeSignature(latest.wanderers);
         if (sig !== beforeSig || sig !== _lastMapSignature) _refreshTownMapIfNeeded(sig);
         renderWanderBroadcastPins(latest);   // 📌 v3.5.77 先更新釘選列（新到場/離場遞補），_announceWanderer 才知道誰已釘選不必重播

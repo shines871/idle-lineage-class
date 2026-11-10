@@ -74,6 +74,7 @@ function recomputeStats() {
     d.poisonHealMult = 0;   // 🏺 遺物 毒液化身：受到毒性 DoT 時恢復所受傷害×此倍率的 HP（js/03 中毒 tick 讀取·0=無）
     d.dotCrit = false;       // 🏺 遺物 永不終止的夢魘：我方持續傷害(中毒/出血/猛爆劇毒)可爆擊（js/06 processMobStatusTick _teamDotCrit 讀取）
     d.dmgReflect = 0;        // 🏺 遺物 魅魔女皇的誘惑：受一般攻擊 N% 機率反射相同傷害且免疫該次（js/04 受擊路徑）
+    d.statusHealHp = 0; d.dotMpRefund = 0;   // 受異常回血加總／DoT 回魔取最高；隨裝備重算，避免每次受擊重掃全身。
     d.fullHpMpHalf = false;  // 🏺 遺物 巫師的黑暗魔導書：滿血時技能 MP 減半（v3.2.39 稽核修：補歸零——原本卸下後永久殘留）
     d.eleWpnMult = null;     // 🏺 遺物 四之牙臂甲：裝備對應屬性武器時一般攻擊傷害 ×mult（{ele,mult}·js/03 getPhysicalDmg＋js/06 傭兵攻擊）
     d.rangedDmg = 0; d.rangedHit = 0; d.rangedCrit = 0;
@@ -93,8 +94,12 @@ function recomputeStats() {
     if (p.eq.wpn) { let w = DB.items[p.eq.wpn.id]; if (w.str) d.str += w.str; if (w.dex) d.dex += w.dex; if (w.int) d.int += w.int; if (w.con) d.con += w.con; if (w.wis) d.wis += w.wis; if (w.cha) d.cha += w.cha; }   // 🔧 與防具迴圈一致讀取六項屬性（含魅力 cha）
     for (let k in p.eq) {
         let e = p.eq[k];
-        if (!e || k === 'wpn') continue;
+        if (!e) continue;
         let ed = DB.items[e.id];
+        if (!ed) continue;
+        if (ed.statusHealHp) d.statusHealHp += ed.statusHealHp;
+        if (ed.dotMpRefund) d.dotMpRefund = Math.max(d.dotMpRefund, ed.dotMpRefund);
+        if (k === 'wpn') continue;
         if (ed.str) d.str += ed.str;
         if (ed.dex) d.dex += ed.dex;
         if (ed.int) d.int += ed.int;

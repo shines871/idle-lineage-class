@@ -9,7 +9,7 @@
 //
 //   ⚠️ baseThreat 直接沿用現行 mercAggroWeight/petAggroWeight/summonAggroWeight/guardAggroWeight
 //      → 開戰瞬間＝完全等同舊靜態權重（累積恆 0 時 base×K 的相對比例＝舊制）。這是零風險遷移基礎。
-//   ⚠️ mob._threat / _threatT 是 runtime 狀態·**存檔前必剝除**（js/13 normalizeFacingRefsForSave）。
+//   ⚠️ mob._threat / _threatT 是 runtime 狀態·存檔只從輸出副本剝除（js/13 saveStateJson）。
 //
 //   歸因採「快照差分」（比照 js/03 DPS 的 _dpsSnap/_dpsDealt·各自獨立函式勿混用）：
 //     玩家＝玩家階段整段一個視窗（js/03）；傭兵＝逐傭兵回合視窗（js/06）；
@@ -126,15 +126,19 @@ function ironGuardTauntWeakensAttack(m) { return !!_ironGuardTauntState(m); }
 function threatCommitDiff(snap, ent) {
     if (!THREAT_ENABLED || !snap || !ent) return;
     if (typeof mapState === 'undefined' || !mapState || !mapState.mobs) return;
-    let mult = computeThreatMult(ent);
-    if (!(mult > 0)) return;   // 隱身斗篷等：不累積
-    let key = threatKey(ent), mobs = mapState.mobs, now = _threatNow();
+    let mult, key, now, mobs = mapState.mobs;
     for (let i = 0; i < snap.length; i++) {
         if (snap[i] == null) continue;
         let m = mobs[i];
         if (!m || m._dead) continue;
         let lost = snap[i] - Math.max(0, m.curHp || 0);
         if (lost <= 0) continue;
+        if (mult === undefined) {   // 冷卻／空回合不掃裝備；有傷害才計算一次本次歸因的係數。
+            mult = computeThreatMult(ent);
+            if (!(mult > 0)) return;   // 隱身斗篷等：不累積
+            key = threatKey(ent);
+            now = _threatNow();
+        }
         let amt = lost * mult;
         if (m.boss) amt *= 0.5;   // 🐲 BOSS：threatMult 全體減半（更偏隨機·免一坦鎖死全場）
         _threatAdd(m, key, amt, now);
@@ -167,7 +171,7 @@ function victimThreatWeight(m, ent, baseWeight) {
     return baseWeight * THREAT_K + threatOf(m, threatKey(ent));
 }
 
-// ---------- 七、存檔剝除（runtime 狀態不入檔·語意上仇恨讀檔本該歸零） ----------
+// ---------- 七、載入舊存檔時清除 runtime 狀態（正常存檔不改動戰鬥中的仇恨） ----------
 function stripThreatForSave() {
     if (typeof mapState === 'undefined' || !mapState || !mapState.mobs) return;
     for (let m of mapState.mobs) { if (m) { if (m._threat) delete m._threat; if (m._threatT != null) delete m._threatT; if (m._ironGuardTaunt) delete m._ironGuardTaunt; } }

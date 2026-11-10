@@ -1,6 +1,6 @@
 ﻿/** 遊戲核心資料庫 */
 // 🏷️ 遊戲版本號（顯示於登入頁面下方·單一真相來源）：更新版本時只改這一行，登入頁面自動同步。
-const GAME_VERSION = 'v3.8.34';   // 🏷️ 版本號：末段 0~99 線性遞增，達 100 進位（中位 +1、末段歸 0）
+const GAME_VERSION = 'v3.8.39';   // 🏷️ 版本號：末段 0~99 線性遞增，達 100 進位（中位 +1、末段歸 0）
 // ===== 💾 存檔壓縮（LZString compressToUTF16/decompressFromUTF16·MIT, Pieroxy）：localStorage 內部以 UTF-16 壓縮，省 ~89%，繞過 5MB 上限 =====
 //  ⚠️ 只壓 localStorage（存檔位/倉庫/共用桶/_bak）；匯出檔維持明文 JSON（可攜·importSave 用 JSON.parse 驗證）。_lzGet 相容舊明文存檔（無 'LZ1:' 前綴→原樣回傳）。
 var LZString = (function () {
@@ -100,14 +100,317 @@ var LZString = (function () {
 var _FS = (typeof window !== 'undefined' && window.fableStore) ? window.fableStore : null;
 // 🖥️ 打包版標記：在 <html> 加 .pkg-build → 套用打包專屬樣式（如下拉清單選項間隔加大·見 css/style.css）。網頁版(無 fableStore)不加→維持原樣。
 try { if (_FS && typeof document !== 'undefined' && document.documentElement) document.documentElement.classList.add('pkg-build'); } catch (e) {}
-function _lsGet(k) { try { return _FS ? _FS.get(k) : localStorage.getItem(k); } catch (e) { return null; } }
-function _lsSet(k, v) { try { if (_FS) return _FS.set(k, v); localStorage.setItem(k, v); return true; } catch (e) { return false; } }
-function _lsRemove(k) { try { if (_FS) { _FS.remove(k); return; } localStorage.removeItem(k); } catch (e) {} }
+var _itemTransaction = null;
+var _itemTransactionStorageBlocked = false;
+var _itemTransactionStorageError = null;
+var _itemTransactionLockHeld = false;
+var _itemTransactionRecoveryPending = false;
+var _itemTransactionRecoveryReadBlocked = false;
+var _itemTransactionRecoveryPromise = null;
+var _itemTransactionReloadRequested = false;
+const ITEM_TRANSACTION_JOURNAL_KEY = 'lineage_idle_item_transaction';
+const ITEM_TRANSACTION_LOCK_NAME = 'lineage_idle_item_transaction_lock';
+function _itemTransactionNotice(message, persistent) {
+  let shown = false;
+  try {
+    if (persistent && typeof document !== 'undefined') {
+      let host = document.body || document.documentElement;
+      if (host) {
+        let el = document.getElementById('item-transaction-storage-notice');
+        if (!el) {
+          el = document.createElement('div'); el.id = 'item-transaction-storage-notice';
+          el.setAttribute('role', 'alert');
+          el.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:32px;background:rgba(15,23,42,.96);color:#fef3c7;font:18px/1.7 sans-serif;text-align:center;';
+          host.appendChild(el);
+        }
+        el.textContent = message; shown = true;
+      }
+    } else if (typeof logSys === 'function') {
+      logSys(String(message).replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c])));
+      shown = true;
+    }
+  } catch (_) {}
+  if (!shown) { try { if (typeof alert === 'function') alert(message); } catch (_) {} }
+}
+function _itemLockManager() {
+  return typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function' ? navigator.locks : null;
+}
+async function _withItemTransactionLock(action, label) {
+  let name = label || '物品操作', locks = _itemLockManager();
+  if (!locks) {
+    _itemTransactionNotice('目前環境不支援安全儲存，已取消' + name + '。請使用新版瀏覽器的 HTTPS 網址或安裝版。');
+    return false;
+  }
+  if (_itemTransactionStorageBlocked || _itemTransactionRecoveryReadBlocked) {
+    _itemTransactionNotice('儲存資料尚未恢復，已取消' + name + '。請依畫面提示處理。');
+    return false;
+  }
+  try {
+    return await locks.request(ITEM_TRANSACTION_LOCK_NAME, { mode: 'exclusive', ifAvailable: true }, async lock => {
+      if (!lock) { _itemTransactionNotice('另一個視窗正在保存物品，已取消' + name + '，請稍後再試。'); return false; }
+      _itemTransactionLockHeld = true;
+      try {
+        if (_itemTransactionStorageBlocked || _itemTransactionRecoveryReadBlocked) return false;
+        if (_itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) != null) {
+          _itemBlockStorage(new Error('An unfinished item transaction requires reload and recovery'));
+          _itemTransactionNotice('偵測到未完成的物品交易，已暫停儲存。請重新載入遊戲以恢復原始資料。', true);
+          return false;
+        }
+        return await action();
+      } finally { _itemTransactionLockHeld = false; }
+    });
+  } catch (e) {
+    _itemTransactionNotice(name + '未完成：' + (e && e.message ? e.message : '無法取得安全儲存鎖。'));
+    return false;
+  }
+}
+// 底層原始讀取不經草稿，僅供提交、驗證與恢復使用。
+function _itemReadRaw(k) {
+  let raw = _FS ? _FS.get(k) : localStorage.getItem(k);
+  if (raw == null && _FS && typeof _FS.has === 'function' && _FS.has(k)) throw new Error('Stored value could not be read: ' + k);
+  if (raw != null && typeof raw !== 'string') throw new Error('Invalid stored value: ' + k);
+  return raw == null ? null : raw;
+}
+function _itemTransactionFail(tx, error) {
+  if (tx && !tx.error) tx.error = error instanceof Error ? error : new Error(String(error));
+  return false;
+}
+function _itemSnapshotRaw(tx, key) {
+  if (tx.error) throw tx.error;
+  if (!tx.before.has(key)) tx.before.set(key, _itemReadRaw(key));
+  return tx.before.get(key);
+}
+function _lsGetStrict(k) {
+  let tx = _itemTransaction;
+  try {
+    if (_itemTransactionRecoveryReadBlocked) throw _itemTransactionStorageError || new Error('Item transaction recovery is pending');
+    let key = String(k);
+    if (!tx) return _itemReadRaw(key);
+    let before = _itemSnapshotRaw(tx, key);
+    return tx.pending.has(key) ? tx.pending.get(key) : before;
+  } catch (e) { _itemTransactionFail(tx, e); throw e; }
+}
+function _lsGet(k) {
+  if (_itemTransaction) return _lsGetStrict(k); // 交易不能把讀取失敗偽裝成空桶。
+  if (_itemTransactionRecoveryReadBlocked) return null;
+  try { return _FS ? _FS.get(k) : localStorage.getItem(k); } catch (e) { return null; }
+}
+function _itemStageRaw(key, value) {
+  let tx = _itemTransaction;
+  try {
+    if (_itemTransactionStorageBlocked) throw _itemTransactionStorageError || new Error('Storage recovery is required');
+    if (key === ITEM_TRANSACTION_JOURNAL_KEY) throw new Error('Reserved transaction key');
+    _itemSnapshotRaw(tx, key);
+    tx.pending.set(key, value);
+    return true;
+  } catch (e) { return _itemTransactionFail(tx, e); }
+}
+function _lsSet(k, v) {
+  if (_itemTransaction) {
+    try { return _itemStageRaw(String(k), String(v)); } catch (e) { return _itemTransactionFail(_itemTransaction, e); }
+  }
+  if (!_itemCanWriteStorage()) return false;
+  try { if (_FS) return _FS.set(k, v); localStorage.setItem(k, v); return true; } catch (e) { return false; }
+}
+function _lsRemove(k) {
+  if (_itemTransaction) {
+    try { return _itemStageRaw(String(k), null); } catch (e) { return _itemTransactionFail(_itemTransaction, e); }
+  }
+  if (!_itemCanWriteStorage()) return false;
+  try { if (_FS) _FS.remove(k); else localStorage.removeItem(k); return true; } catch (e) { return false; }
+}
+function _itemCanWriteStorage() {
+  if (_itemTransactionStorageBlocked || _itemTransactionRecoveryReadBlocked) return false;
+  try { return _itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) == null; }
+  catch (e) { return _itemBlockStorage(e); }
+}
 
 // Web saves are written immediately, then compressed in a Worker so LZString cannot block
 // rendering or combat. A per-key revision plus raw-value guard prevents stale Worker output
 // from replacing a newer save, including writes made by another open tab/window.
 var _lzWorker = null, _lzWorkerSeq = 0, _lzWorkerRev = Object.create(null), _lzWorkerRaw = Object.create(null);
+function _itemWriteRaw(key, value) {
+  if (!_FS) _lzWorkerRev[key] = (_lzWorkerRev[key] || 0) + 1;
+  if (value == null) {
+    if (_FS) _FS.remove(key); else localStorage.removeItem(key);
+  } else if (_FS) {
+    if (_FS.set(key, value) !== true) throw new Error('Stored value could not be written: ' + key);
+  } else localStorage.setItem(key, value);
+  if (_itemReadRaw(key) !== value) throw new Error('Stored value verification failed: ' + key);
+}
+function _itemWriteWithQuotaFallback(key, value) {
+  try { _itemWriteRaw(key, value); return value; }
+  catch (e) {
+    let quota = e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22 || e.code === 1014);
+    if (_FS || !quota || typeof value !== 'string' || value.startsWith('LZ1:')) throw e;
+    // 與一般存檔一致：只有配額不足才同步壓縮；一般手動交易不阻塞主執行緒壓大檔。
+    let packed = 'LZ1:' + LZString.compressToUTF16(value);
+    if (packed.length >= value.length) throw e;
+    _itemWriteRaw(key, packed);
+    return packed;
+  }
+}
+function _itemBlockStorage(error) {
+  _itemTransactionStorageBlocked = true;
+  _itemTransactionStorageError = error instanceof Error ? error : new Error(String(error));
+  return false;
+}
+function _itemJournalEntries(raw) {
+  let decoded = raw.startsWith('LZ1:') ? LZString.decompressFromUTF16(raw.slice(4)) : raw;
+  let journal = JSON.parse(decoded);
+  if (!journal || journal.v !== 1 || typeof journal.id !== 'string' || !journal.id || !Array.isArray(journal.before))
+    throw new Error('Invalid item transaction journal');
+  let seen = new Set();
+  for (let entry of journal.before) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || !entry[0]
+        || entry[0] === ITEM_TRANSACTION_JOURNAL_KEY || seen.has(entry[0])
+        || (entry[1] !== null && typeof entry[1] !== 'string')) throw new Error('Invalid item transaction entry');
+    seen.add(entry[0]);
+  }
+  return journal.before;
+}
+function _itemEnsureJournal(raw) {
+  let current = _itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY);
+  if (current == null) _itemWriteRaw(ITEM_TRANSACTION_JOURNAL_KEY, raw);
+  else if (current !== raw) throw new Error('Item transaction journal changed');
+}
+function _itemRestoreRaw(entries, journalRaw) {
+  let restore = entry => {
+    try {
+      if (_itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) !== journalRaw) throw new Error('Item transaction journal changed');
+      // 即使原值已在，也必須使尚未回覆的壓縮工作失效。
+      if (!_FS) _lzWorkerRev[entry[0]] = (_lzWorkerRev[entry[0]] || 0) + 1;
+      if (_itemReadRaw(entry[0]) !== entry[1]) _itemWriteRaw(entry[0], entry[1]);
+      return _itemReadRaw(entry[0]) === entry[1];
+    } catch (e) { return false; }
+  };
+  let failed = [];
+  for (let i = entries.length - 1; i >= 0; i--) if (!restore(entries[i])) failed.push(entries[i]);
+  // 新鍵移除後可能釋出空間，僅對失敗項再試一次。
+  return failed.map(restore).every(Boolean);
+}
+function _itemFinishJournal(raw) {
+  if (_itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) !== raw) throw new Error('Item transaction journal changed');
+  try { _itemWriteRaw(ITEM_TRANSACTION_JOURNAL_KEY, null); }
+  catch (e) {
+    // 刪除已發生但驗證失敗時，盡力補回 before images，維持下次啟動可恢復。
+    try { _itemEnsureJournal(raw); } catch (_) {}
+    throw e;
+  }
+}
+function _recoverItemTransaction() {
+  if (_itemTransaction) return _itemBlockStorage(new Error('Cannot recover while an item transaction is staged'));
+  try {
+    let raw = _itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY);
+    if (raw != null) {
+      let entries = _itemJournalEntries(raw);
+      if (!_itemRestoreRaw(entries, raw)) throw new Error('Item transaction recovery failed; original data is retained in the journal');
+      _itemFinishJournal(raw);
+    }
+    _itemTransactionStorageBlocked = false;
+    _itemTransactionStorageError = null;
+    return true;
+  } catch (e) { return _itemBlockStorage(e); }
+}
+function _startItemTransactionRecovery() {
+  if (_itemTransactionRecoveryPending || _itemTransactionReloadRequested) return _itemTransactionRecoveryPromise;
+  let raw;
+  try { raw = _itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY); }
+  catch (e) {
+    _itemTransactionRecoveryReadBlocked = true;
+    _itemBlockStorage(e);
+    _itemTransactionNotice('無法讀取儲存資料，已暫停遊戲。請保留現有資料，排除讀寫問題後再重新載入。', true);
+    return false;
+  }
+  // 無 journal 的一般啟動只讀一次；不可再無鎖重讀後恢復，以免撞上另一頁剛開始的提交。
+  if (raw == null && !_itemTransactionRecoveryReadBlocked) return true;
+  _itemTransactionRecoveryPending = true;
+  _itemTransactionRecoveryReadBlocked = true;
+  _itemBlockStorage(new Error('Waiting for item transaction recovery'));
+  let locks = _itemLockManager();
+  if (!locks) {
+    _itemTransactionRecoveryPending = false;
+    _itemTransactionNotice('偵測到未完成的物品交易，但目前環境無法安全恢復。請保留現有資料，使用新版瀏覽器的 HTTPS 網址或安裝版重新開啟。', true);
+    return false;
+  }
+  _itemTransactionNotice('偵測到未完成的物品交易，正在等待其他視窗完成並恢復資料，請稍候。', true);
+  _itemTransactionRecoveryPromise = Promise.resolve().then(() => locks.request(ITEM_TRANSACTION_LOCK_NAME, { mode: 'exclusive' }, lock => {
+    if (!lock) throw new Error('Item transaction recovery lock unavailable');
+    _itemTransactionLockHeld = true;
+    try {
+      if (!_recoverItemTransaction()) throw _itemTransactionStorageError;
+      // 其他腳本曾讀到被阻擋的空資料；保持公開讀寫關閉，重新載入後才使用恢復完成的資料。
+      _itemBlockStorage(new Error('Item transaction recovered; page reload required'));
+      _itemTransactionReloadRequested = true;
+      try {
+        if (typeof location !== 'undefined' && typeof location.reload === 'function') location.reload();
+        else _itemTransactionNotice('物品資料已恢復，請手動重新載入遊戲。', true);
+      } catch (_) { _itemTransactionNotice('物品資料已恢復，請手動重新載入遊戲。', true); }
+      return true;
+    } finally { _itemTransactionLockHeld = false; _itemTransactionRecoveryPending = false; }
+  })).catch(e => {
+    _itemTransactionRecoveryPending = false;
+    _itemBlockStorage(e);
+    _itemTransactionNotice('物品交易尚未恢復，已暫停遊戲並保留復原資料。請排除儲存空間或讀寫問題後再重新載入。', true);
+    return false;
+  });
+  return _itemTransactionRecoveryPromise;
+}
+function _commitItemTransaction(tx) {
+  if (!tx || !(tx.before instanceof Map) || !(tx.pending instanceof Map)) return false;
+  if (_itemTransaction || _itemTransactionStorageBlocked) return _itemTransactionFail(tx, _itemTransactionStorageError || new Error('Item transaction cannot commit'));
+  if (tx.error) return false;
+  let journalRaw = null, journalAttempted = false, attempted = [], written = new Map();
+  try {
+    if (_itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) != null) {
+      _itemBlockStorage(new Error('An unfinished item transaction requires recovery'));
+      throw _itemTransactionStorageError;
+    }
+    for (let [key, value] of tx.before) {
+      if (_itemReadRaw(key) !== value) throw new Error('Stored data changed during the item transaction: ' + key);
+    }
+    let entries = [];
+    for (let [key, value] of tx.pending) {
+      if (typeof key !== 'string' || !key || key === ITEM_TRANSACTION_JOURNAL_KEY || !tx.before.has(key) || (value !== null && typeof value !== 'string'))
+        throw new Error('Invalid staged item transaction write');
+      if (value !== tx.before.get(key)) entries.push([key, tx.before.get(key)]);
+    }
+    if (!entries.length) return true;
+    journalRaw = JSON.stringify({ v: 1, id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2), before: entries });
+    journalAttempted = true;
+    journalRaw = _itemWriteWithQuotaFallback(ITEM_TRANSACTION_JOURNAL_KEY, journalRaw); // before images 先落盤，空間不足就不碰原資料。
+    for (let [key, value] of tx.before) {
+      if (_itemReadRaw(key) !== value) throw new Error('Stored data changed before item transaction commit: ' + key);
+    }
+    for (let entry of entries) {
+      if (_itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY) !== journalRaw) throw new Error('Item transaction journal changed');
+      if (_itemReadRaw(entry[0]) !== entry[1]) throw new Error('Stored data changed before item transaction write: ' + entry[0]);
+      attempted.push(entry); // 寫入可能先成功再拋例外，因此必須先登記。
+      written.set(entry[0], _itemWriteWithQuotaFallback(entry[0], tx.pending.get(entry[0])));
+    }
+    for (let entry of entries) {
+      if (_itemReadRaw(entry[0]) !== written.get(entry[0])) throw new Error('Committed item transaction data changed: ' + entry[0]);
+    }
+    _itemFinishJournal(journalRaw);
+    if (!_FS) for (let [key, raw] of written) {
+      if (typeof raw === 'string' && raw.length >= 1024 && !raw.startsWith('LZ1:')) {
+        try { _queueLzCompression(key, raw, _lzWorkerRev[key] || 0); } catch (_) {}
+      }
+    }
+    return true;
+  } catch (e) {
+    _itemTransactionFail(tx, e);
+    if (!journalAttempted) return false;
+    try {
+      let current = _itemReadRaw(ITEM_TRANSACTION_JOURNAL_KEY);
+      if (!attempted.length && current == null) return false; // journal 配額失敗，原鍵完全未變。
+      _itemEnsureJournal(journalRaw);
+      if (!_itemRestoreRaw(attempted, journalRaw)) throw new Error('Item transaction rollback failed; retain the journal and stop writing');
+      _itemFinishJournal(journalRaw);
+    } catch (restoreError) { _itemBlockStorage(restoreError); }
+    return false;
+  }
+}
 // Direct raw replacements (backup restore / migration) must invalidate a queued compression
 // result for the same key, otherwise an older Worker reply can overwrite the restored value.
 function _lzSetStoredRaw(key, value) {
@@ -160,6 +463,8 @@ function _queueLzCompression(key, value, rev) {
 })();
 // 壓縮寫入：把 JSON 字串以 'LZ1:'+UTF16 壓縮存入；壓縮或寫入失敗(多半 localStorage 配額)時退回明文（再不行才警告）
 function _lzSet(key, jsonStr) {
+  if (_itemTransaction) return _lsSet(key, jsonStr);
+  if (!_itemCanWriteStorage()) return false;
   // Electron uses real files and is not constrained by localStorage quotas. Writing the
   // signed JSON directly avoids blocking the game loop while LZString compresses a large save.
   // _lzGet already accepts both LZ1-compressed and plain values, so old saves remain compatible.
@@ -179,10 +484,26 @@ function _lzSet(key, jsonStr) {
 }
 // 解壓讀取：'LZ1:' 前綴→解壓；否則原樣回傳（相容舊明文存檔）。回傳 JSON 字串或 null（key 不存在）
 function _lzGet(key) {
+  if (_itemTransaction) return _lzGetStrict(key);
   var raw = _lsGet(key); if (raw == null) return null;
   if (raw.slice(0, 4) === 'LZ1:') { try { return LZString.decompressFromUTF16(raw.slice(4)); } catch (e) { return null; } }
   return raw;
 }
+// 匯出與倉庫交易不能把「讀取／解壓失敗」當成空資料；只有真正不存在才回 null。
+function _lzGetStrict(key) {
+  try {
+  let raw = _lsGetStrict(key);
+  if (raw == null) return null;
+  if (typeof raw !== 'string') throw new Error('Invalid stored value: ' + key);
+  if (raw.slice(0, 4) !== 'LZ1:') return raw;
+  let decoded = LZString.decompressFromUTF16(raw.slice(4));
+  if (typeof decoded !== 'string' || decoded === '') throw new Error('Stored value could not be decompressed: ' + key);
+  return decoded;
+  } catch (e) { _itemTransactionFail(_itemTransaction, e); throw e; }
+}
+
+// 儲存層與舊桌面資料遷移就緒後，先恢復未完成交易，再讓其餘遊戲腳本載入。
+_startItemTransactionRecovery();
 
 // 🎲 種子型亂數（決定論 PRNG·xmur3→mulberry32）：相同的字串輸入永遠得到同一個 [0,1) 值。
 //    用途＝把「強化成敗」改成由存檔內種子決定，讓讀檔/匯入舊檔回到強化前也算出完全相同的結果（杜絕 save/load 刷強化值）。

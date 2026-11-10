@@ -907,6 +907,11 @@ function allyQiguAttack(ally, t, wpn) {
     if (t.st && t.st.mrhalf > 0) t.st.mrhalf = 0;
     mobWake(t);
     if (typeof reflectWallOnDamage === 'function') reflectWallOnDamage(t, dmg, 'magic', ally);   // 🌑 v3.4.14 血壁空間：奇古獸普攻主擊＝魔法反射（鏡像玩家 qiguPlayerAttack）
+    if (ally._downed || ally.curHp <= 0) {
+        let ri = mapState.mobs.findIndex(m => m && m.uid === t.uid);
+        if (t.curHp <= 0) { if (ri !== -1) killMob(ri); } else if (!state.ff) renderMobs();
+        return;   // 反射致死後僅收尾主擊，不再追擊、回魔或觸發武器特效。
+    }
     if (t.curHp > 0 && ally._setIron5 && typeof ironGuardTaunt === 'function' && ironGuardTaunt(t, ally)) logCombat(`<span class="font-bold" style="color:#93c5fd;text-shadow:0 0 6px #3b82f6;">【協力·${ally._allyName}·鐵衛 5/5】</span>嘲諷 <span class="${getMobColor(t.lv)}">${t.n}</span>！（3 秒）`, 'player-special');
     if (ally._setWhiteBird5 && t.curHp > 0 && !t._dead) { if (!t.st) t.st = newMobStatus(); t.st.fragile = 30; }   // 🔮 白鳥 5/5（傭兵奇古獸）：命中附加脆弱（魔法路徑不經 allyOnHitEffects，故此處補上）
     logCombat(`<span class="text-emerald-300 font-bold">【協力·${ally._allyName}】</span>奇古獸對 <span class="${getMobColor(t.lv)}">${t.n}</span> 造成 ${dmg} 點魔法傷害。`, 'magic');
@@ -953,6 +958,11 @@ function allyAttackOnce(ally, _arrowDelay) {   // 🏹 v3.2.14 _arrowDelay(選�
         dmg = Math.max(1, Math.floor(dmg * royalAllyMult()));   // 👑 王族魅力加成：傭兵造成傷害 ×(1+魅力/200)
         t.curHp -= dmg; if (typeof moonShatterOnDamage === 'function') moonShatterOnDamage(ally, t, dmg); t.justHit = 'magic'; mobWake(t);
         if (typeof reflectWallOnDamage === 'function') reflectWallOnDamage(t, dmg, 'magic', ally);   // 🌑 v3.4.14 血壁空間：法師光箭普攻主擊＝魔法反射（普攻主擊反射·玩家傭兵一致）
+        if (ally._downed || ally.curHp <= 0) {
+            let ri = mapState.mobs.findIndex(m => m && m.uid === t.uid);
+            if (t.curHp <= 0) { if (ri !== -1) killMob(ri); } else if (!state.ff) renderMobs();
+            return;
+        }
         if (t.curHp > 0 && ally._setIron5 && typeof ironGuardTaunt === 'function' && ironGuardTaunt(t, ally)) logCombat(`<span class="font-bold" style="color:#93c5fd;text-shadow:0 0 6px #3b82f6;">【協力·${ally._allyName}·鐵衛 5/5】</span>嘲諷 <span class="${getMobColor(t.lv)}">${t.n}</span>！（3 秒）`, 'player-special');
         logCombat(`<span class="text-emerald-300 font-bold">【協力·${ally._allyName}】</span>魔法攻擊 <span class="${getMobColor(t.lv)}">${t.n}</span>，造成 <span class="${isCrit?'text-yellow-500 font-bold':'text-emerald-200'}">${dmg}</span> 點傷害。`, 'magic');
         allyWeaponProcs(ally, t, { hit: true, dmg: dmg });   // 🔧 法師普攻（光箭）也觸發武器特效：共鳴/魔擊/瑪那回魔
@@ -1202,7 +1212,13 @@ function allyDualWieldOffhandAttack(ally, t) {
     if (!allyDualWieldOffhandOk(ally) || !ally.eq.offwpn || !allyWarriorDualWieldWpnOk(ally, ally.eq.offwpn.id)) return;
     let owpn = DB.items[ally.eq.offwpn.id];
     let r = allyStrikeRoll(ally, t, { wpnInst: ally.eq.offwpn });   // 副手獨立命中（基礎骰＋近戰加成）；🛡️ v2.6.69 審計#5：改吃「副手自身」強化最終倍率（與玩家副手揮擊改用 wpnInst 對齊·原 noEnhance 恆×1 與玩家不一致）
-    if (!r.hit) { if (typeof vfxMiss === 'function') vfxMiss(t); logCombat(`<span class="font-bold" style="color:#fbbf24;">【協力·${ally._allyName}·迅猛雙斧】</span>副手追擊 <span class="${getMobColor(t.lv)}">${t.n}</span> 未命中。`, 'miss'); return; }
+    if (!r.hit) {
+        if (typeof vfxMiss === 'function') vfxMiss(t);
+        logCombat(`<span class="font-bold" style="color:#fbbf24;">【協力·${ally._allyName}·迅猛雙斧】</span>副手追擊 <span class="${getMobColor(t.lv)}">${t.n}</span> 未命中。`, 'miss');
+        // 僅新遺物補攻擊觸發；false 保留命中特效條件，副手實例避免娃娃重複觸發。
+        if (owpn && owpn.relicBaseId) allyWeaponProcs(ally, t, { hit: false, dmg: 0 }, ally.eq.offwpn);
+        return;
+    }
     if (allyOffhandInstakillProc(ally, ally.eq.offwpn, owpn, t)) return;   // ⚔️ v3.5.97 副手即死 proc（鏡像玩家：成功則不再跑一般扣血）
     let dmg = r.dmg;
     if (ally.skills.includes('sk_warrior_berserk') && Math.random() < 0.05) dmg = Math.max(1, dmg * 2);   // ⚔️ 狂暴：副手亦為一般攻擊
@@ -1755,7 +1771,9 @@ function allyProcFreeMagicSkill(ally, t, skId, en, areaHit, sourceItem, illusion
     if (total > 0) {
         if (t.st && t.st.mrhalf > 0) t.st.mrhalf = 0;
         logCombat(`<span class="font-bold" style="color:#93c5fd;text-shadow:0 0 6px #2563eb;">【協力·${ally._allyName}·${sk.n}】</span>額外施放，對 <span class="${getMobColor(t.lv)}">${t.n}</span> 造成 <span class="${isCrit ? 'text-yellow-500 font-bold' : 'text-cyan-300'}">${total}</span> 點傷害${isCrit ? '（爆擊!）' : ''}。`, 'player-special');
-        if (sk.lifesteal) { let _h = Math.min(total, (ally.mhp || 0) - (ally.curHp || 0)); if (_h > 0) { ally.curHp = Math.min(ally.mhp || 1, (ally.curHp || 0) + _h); logCombat(`<span class="text-emerald-300 font-bold">【協力·${ally._allyName}】</span>吸取了 ${_h} 點生命。`, 'heal', 'mercenary'); } }   // 🩸 v3.2.43 稽核修：吸血法術 proc 觸發也回血（鏡像玩家 procFreeMagicSkill·比照 js/06:610 allyCastMagic）
+        // 恐怖的面貌會在扣血後完整還原魔法傷害；維持一般吸血在擊殺前的時序，只略過免疫。
+        let _magicImmune = t._reflectWall && t._reflectWall.block && t._reflectWall.kind === 'magic' && state.ticks <= t._reflectWall.until && !t._dead;
+        if (sk.lifesteal && !_magicImmune) { let _h = Math.min(total, (ally.mhp || 0) - (ally.curHp || 0)); if (_h > 0) { ally.curHp = Math.min(ally.mhp || 1, (ally.curHp || 0) + _h); logCombat(`<span class="text-emerald-300 font-bold">【協力·${ally._allyName}】</span>吸取了 ${_h} 點生命。`, 'heal', 'mercenary'); } }   // 🩸 v3.2.43 稽核修：吸血法術 proc 觸發也回血（鏡像玩家 procFreeMagicSkill·比照 js/06:610 allyCastMagic）
         _allyDamageMob(ally, t, total, (sk.ele && sk.ele !== 'none') ? sk.ele : 'magic', 'magic');
     }
     if (t.curHp > 0 && sk.freeze) applyMobStatus(t, { kind: 'freeze', pbase: sk.freeze, dur: 6 }, sk.n);
@@ -1830,6 +1848,7 @@ function _allyMagicStrikeHit(ally, t, wpnInst, wpn) {
 // ⚔️ v3.5.97 instOverride：指定要判定的武器實例（迅猛雙斧副手＝ally.eq.offwpn），鏡像玩家 weaponSpellProc 的同名參數。
 //   ⚠️ 傳入時跳過魔法娃娃 proc——娃娃是「角色每次攻擊」的效果，不隨武器數量倍增（與玩家端同一決定）。
 function allyWeaponProcs(ally, target, hitInfo, instOverride) {
+    if (!ally || ally._downed || ally.curHp <= 0) return;
     if (!instOverride) allyDollAttackProcs(ally, target);   // 🆕 v2.6.10 #3：魔法娃娃攻擊 proc（置於武器判定前→無武器也生效，比照玩家）
     let wpnInst = instOverride || (ally.eq && ally.eq.wpn);
     if (!wpnInst) return;

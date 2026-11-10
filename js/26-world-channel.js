@@ -23,7 +23,34 @@ let _wcIdleTimer = null;                     // 每分鐘世界頻道自動閒�
 let _wcRecentIdleLines = [];                 // 避免短時間重複抽到相同閒聊
 let _wcPrivateActiveId = null;               // 目前開啟私訊的 NPC
 let _wcPrivatePendingIds = Object.create(null); // 正在等待模型回覆的 NPC
+let _wcSession = 0;
+const _wcReplyTimers = new Set();
 const WC_RECENT_CHAT_LIMIT = 60;
+
+function resetWorldChannelSession() {
+    _wcSession++;
+    _wcReplyTimers.forEach(timer => clearTimeout(timer));
+    _wcReplyTimers.clear();
+    worldChannelCloseMenu();
+    let overlay = document.getElementById('world-channel-private-overlay');
+    if (overlay) overlay.remove();
+    _wcPrivateActiveId = null;
+    _wcPrivatePendingIds = Object.create(null);
+    _wcNpcs = Object.create(null);
+    _wcAskCooldownUntil = 0;
+    _wcRecentIdleLines = [];
+    _wcRecentTrashIdx = [];
+}
+
+function _wcScheduleReply(callback, delay) {
+    let session = _wcSession, owner = player;
+    let timer = setTimeout(function () {
+        _wcReplyTimers.delete(timer);
+        if (session !== _wcSession || owner !== player || !_wcCanIdleChat()) return;
+        callback();
+    }, delay);
+    _wcReplyTimers.add(timer);
+}
 
 function _wcSpawnNpc() {
     let clsKeys = (typeof CLAN_CLASS_NAMES === 'object' && CLAN_CLASS_NAMES) ? Object.keys(CLAN_CLASS_NAMES) : ['knight'];
@@ -1756,10 +1783,8 @@ function _wcPostTrashTalk() {
     let pair = _wcPickTrashPair();
     if (!pair) return;
     let a = _wcSpawnNpc(), b = _wcSpawnNpc();
-    for (let guard = 0; guard < 6 && b === a; guard++) b = _wcSpawnNpc();   // 兩邊必須是不同人，否則變成自言自語
-    if (b === a) return;                                                     // 名冊真的只剩一人（極端情況）→ 這輪跳過
     logWorld(`<span class="wc-answer wc-idle-chat">${_wcNameHtml(a)}：${_wcEsc(pair[0])}</span>`);
-    setTimeout(function () {
+    _wcScheduleReply(function () {
         if (!_wcCanIdleChat()) return;
         logWorld(`<span class="wc-answer wc-idle-chat">${_wcNameHtml(b)}：${_wcEsc(pair[1])}</span>`);
     }, 900 + Math.floor(Math.random() * 900));
@@ -1782,11 +1807,13 @@ function _wcPickIdleChatLine() {
 }
 function _wcLogOptionalNpcLine(id, npc, kind, question, fallback, className) {
     fallback = String(fallback || '').trim();
+    let session = _wcSession, owner = player;
     let nameHtml = _wcNameHtml(id);
     let emitted = false;
     function emit(text) {
         if (emitted) return;
         emitted = true;
+        if (session !== _wcSession || owner !== player || _wcNpcs[id] !== npc || !_wcCanIdleChat()) return;
         let finalText = String(text || '').trim() || fallback;
         logWorld(`<span class="${className}">${nameHtml}：${_wcEsc(finalText)}</span>`);
     }
@@ -1862,7 +1889,7 @@ function _wcPostIdleChat() {
     if (Math.random() < 0.35) { _wcPostTrashTalk(); return; }   // 🔥 v3.6.74 三成機率改成兩人互嗆（其餘維持原本的日常閒聊）
     let count = 1 + Math.floor(Math.random() * 3);
     for (let i = 0; i < count; i++) {
-        setTimeout(function() {
+        _wcScheduleReply(function() {
             if (!_wcCanIdleChat()) return;
             let id = _wcSpawnNpc();
             _wcLogOptionalNpcLine(id, _wcNpcs[id], 'chat', '', _wcPickIdleChatLine(), 'wc-answer wc-idle-chat');
@@ -2170,7 +2197,7 @@ function worldChannelAsk() {
     for (let i = 0; i < n; i++) {
         let delay = 500 + i * (600 + Math.floor(Math.random() * 900));
         (function (kind, delay) {
-            setTimeout(function () {
+            _wcScheduleReply(function () {
                 try {
                     let id = _wcSpawnNpc();
                     let npc = _wcNpcs[id];
@@ -2284,7 +2311,9 @@ function socialRememberNpc(npc, persist) {
     player.socialNpcContacts.unshift(contact);
     player.socialNpcContacts = player.socialNpcContacts.slice(0, 20);
     if (persist !== false && typeof saveGame === 'function') saveGame();
-    if (typeof renderPvpTab === 'function') renderPvpTab();
+    let panel = document.getElementById('tab-pvp');
+    if (panel && !panel.classList.contains('hidden') && _wcCanIdleChat()
+        && typeof renderPvpTab === 'function') renderPvpTab();
 }
 function socialGetRecentContacts() {
     if (typeof pvpEnsureState === 'function') pvpEnsureState();
@@ -2567,7 +2596,7 @@ function _wcPrivateRemoveWorldGrudge(npc) {
         });
         if (!removed) return false;
         if (typeof pvpReleaseAlignLock === 'function') pvpReleaseAlignLock(npc.name);
-        if (typeof saveGame === 'function') saveGame();
+        // 私訊送出流程會連同對話一起保存，避免同一句全量寫檔兩次。
         return true;
     } catch (e) { return false; }
 }
@@ -2602,7 +2631,7 @@ function _wcPrivateApplyImpact(npc, message) {
         npcClanAdjustHatred(npc.clanId, clanDelta);
     }
     if (before < 50 && npc.privateHatred >= 50 && npc.privateEmotionOutcome !== 'bond')
-        result.grudgeAdded = _wcAddGrudge(npc, { silent:true });
+        result.grudgeAdded = _wcAddGrudge(npc, { silent:true, deferSave:true });
     if (delta < 0 && npc.privateHatred === 0)
         result.grudgeReleased = _wcPrivateRemoveWorldGrudge(npc);
     return result;
@@ -2739,8 +2768,7 @@ function worldChannelPrivateSend(rawMessage) {
     _wcPrivatePush(npc, 'player', message);
     let privateHistory = _wcPrivatePrompt(npc);
     let impact = _wcPrivateApplyImpact(npc, message);
-    let emotion = _wcPrivateApplyEmotion(npc, message);
-    socialRememberNpc(npc);   // 每句情緒變化立即保存；不在畫面顯示數值或端點
+    _wcPrivateApplyEmotion(npc, message);
 
     let fallback = _wcPrivateFallback(npc, message, impact.mood);
     let privateTopicMessage = _wcPrivateContinuationTopic(npc, message);
@@ -2759,6 +2787,10 @@ function worldChannelPrivateSend(rawMessage) {
         return;
     }
 
+    // 本地回覆在上方合併保存；模型回覆前先保存已送出的內容與情緒變化。
+    socialRememberNpc(npc);
+    let session = _wcSession, owner = player;
+    let current = () => session === _wcSession && owner === player;
     _wcPrivatePendingIds[id] = true;
     _wcPrivateRender();
     let attitude = npc.privateEmotionOutcome === 'chase'
@@ -2778,15 +2810,19 @@ function worldChannelPrivateSend(rawMessage) {
             grounded: grounded,
             fallback: fallback
         }, 15000)).then(function(reply) {
+            if (!current()) return;
             _wcPrivatePush(npc, 'npc', String(reply || '').trim() || fallback);
         }).catch(function() {
+            if (!current()) return;
             _wcPrivatePush(npc, 'npc', fallback);
         }).finally(function() {
+            if (!current()) return;
             delete _wcPrivatePendingIds[id];
             socialRememberNpc(npc);
             if (_wcPrivateActiveId === id) _wcPrivateRender();
         });
     } catch (e) {
+        if (!current()) return;
         delete _wcPrivatePendingIds[id];
         _wcPrivatePush(npc, 'npc', fallback);
         socialRememberNpc(npc);

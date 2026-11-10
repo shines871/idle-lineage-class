@@ -97,6 +97,10 @@ function gainItem(id, cnt=1, silent=false, forceNormal=false, affixOld=false, de
         d = DB.items[id];
     }
 
+    if (typeof _itemTransaction !== 'undefined' && _itemTransaction) {
+        if (!d || !Number.isSafeInteger(cnt) || cnt <= 0) _itemTransactionAbort('無效的製作或兌換獎勵');
+    }
+
     // 🗡️ 裝備收集冊：獲得任何武器/防具/飾品(非箭矢)即登錄圖鑑（永久·只增不減）
     if (typeof registerEquipObtained === 'function') registerEquipObtained(id);
     // 🧰 道具收集冊：獲得任何可分類道具即登錄（藥水/卷軸/技能書/材料/其他）
@@ -106,7 +110,9 @@ function gainItem(id, cnt=1, silent=false, forceNormal=false, affixOld=false, de
 
     // 🔧 持有上限 maxHold（如精靈的私語=10）：裁切本次獲得量使總持有不超過上限；已達上限則不獲得
     if (d && d.maxHold) {
-        let _held = player.inv.reduce((s, i) => s + (i.id === id ? (i.cnt || 0) : 0), 0);
+        let _inTxn = typeof _itemTransaction !== 'undefined' && _itemTransaction;
+        let _held = player.inv.reduce((s, i) => s + (i.id === id ? (_inTxn ? _itemTransactionCount(i.cnt) : (i.cnt || 0)) : 0), 0);
+        if (_inTxn && _held + cnt > d.maxHold) _itemTransactionAbort('獎勵超過持有上限');
         if (_held >= d.maxHold) return null;
         if (_held + cnt > d.maxHold) cnt = d.maxHold - _held;
     }
@@ -149,7 +155,8 @@ function gainItem(id, cnt=1, silent=false, forceNormal=false, affixOld=false, de
     let ex = _gw ? null : (_fastGainIndex
         ? _findCatchupGainItemStack(_probe)
         : player.inv.find(i => !i.gw && (!_lockMergeOff || !i.lock) && sameItemSig(i, _probe)));   // 🔧 架構#3：統一簽章比對（itemSig 已含 en→+0 只併 +0、+3 只併 +3，永不誤併不同強化值）；⚠️ 巨靈願望戒指(gw)每只獨立·簽章不含 gw 故顯式排除
-    if(ex) ex.cnt += cnt;   // 僅加數量、不更動既有堆疊的廢品狀態
+    if(ex) ex.cnt = (typeof _itemTransaction !== 'undefined' && _itemTransaction)
+        ? _itemTransactionCount(_itemTransactionCount(ex.cnt) + cnt) : ex.cnt + cnt;   // 舊存檔缺 cnt 視為 1；交易不得合併出 NaN、字串或溢位
     else { let _push = { id: id, uid: uid(), cnt: cnt, en: _tEn, bless: bless, anc: anc, attr: attr, seteff: seteff, lock: false, junk: !!(player.junkPrefs && player.junkPrefs[itemSig(_probe)]) && !(d && d.noJunk) }; if (_gw) _push.gw = _gw; player.inv.push(_push); if (_fastGainIndex) _rememberCatchupGainItemStack(_push); }   // 🔧 廢品記憶改以完整簽章比對：詞綴物品也可自動標記，但僅限「完全相同詞綴」者；🎴 noJunk(收集冊)永不自動標記
 
     // 紀錄這次產生的物品屬性
@@ -900,24 +907,30 @@ function royalEquipOk(d, id) {
     return false;
 }
 function checkCanEquip(item) {
-    let d = DB.items[item.id];
+    let equipId = item.id, d = DB.items[equipId];
+    // 固定遺物變體沿原裝備的完整判定（含具名／ID 例外）；舊手工遺物仍維持 req 規則。
+    if (d && d.relicBaseId !== undefined) {
+        let baseId = d.relicBaseId, base = typeof baseId === 'string' && DB.items[baseId];
+        if (!base || base.relic || base.relicBaseId !== undefined || !['wpn', 'arm', 'acc'].includes(base.type)) return false;
+        equipId = baseId; d = base;
+    }
     if (d && d.reqAvatar && player && ((d.strictAvatar && player.avatar !== d.reqAvatar) || (!d.strictAvatar && player.avatar && player.avatar !== d.reqAvatar))) return false;   // 👸 性別頭像限定；strictAvatar（純潔少女的憐愛）要求必須明確為女妖精，舊檔缺 avatar 亦不放行
     // 🏺 遺物：職業限制純以 req 白名單為準＝略過各職業專屬 *EquipOk 武器/防具清單（否則戰士等會被拒）。
     //    ⚠️ v3.7.83 修：原本這裡是 `return reqAllowsClass(...)` 直接早退，連帶把下方共用尾段的**劍術精通例外**也跳過了
     //    → 妖精選劍術精通後，一般的騎士限定單手武器借得到、同條件的「遺物」卻裝不上（8 件）。改成只跳過 *EquipOk 分派、
     //    仍走同一條尾段，遺物與一般裝備的判定路徑就完全一致。
     if (!isRelic(d)) {
-        if (player.cls === 'dark') return darkEquipOk(d, item.id);   // 🔧 黑暗妖精專屬裝備規則
-        if (player.cls === 'illusion') return illusionEquipOk(d, item.id);   // 🔮 幻術士專屬裝備規則（除匕首外的全職業裝備＋開放清單）
-        if (player.cls === 'dragon') return dragonEquipOk(d, item.id);   // 🐉 龍騎士專屬裝備規則（除匕首外的全職業裝備＋開放清單）
-        if (player.cls === 'warrior') return warriorEquipOk(d, item.id);   // ⚔️ 戰士專屬裝備規則（白名單制：鈍器＋全職非盾防具＋開放清單）
-        if (player.cls === 'royal') return royalEquipOk(d, item.id);   // 👑 王族專屬裝備規則（全職業裝備＋具名開放清單）
+        if (player.cls === 'dark') return darkEquipOk(d, equipId);   // 🔧 黑暗妖精專屬裝備規則
+        if (player.cls === 'illusion') return illusionEquipOk(d, equipId);   // 🔮 幻術士專屬裝備規則（除匕首外的全職業裝備＋開放清單）
+        if (player.cls === 'dragon') return dragonEquipOk(d, equipId);   // 🐉 龍騎士專屬裝備規則（除匕首外的全職業裝備＋開放清單）
+        if (player.cls === 'warrior') return warriorEquipOk(d, equipId);   // ⚔️ 戰士專屬裝備規則（白名單制：鈍器＋全職非盾防具＋開放清單）
+        if (player.cls === 'royal') return royalEquipOk(d, equipId);   // 👑 王族專屬裝備規則（全職業裝備＋具名開放清單）
     }
     // 1. 基本職業判定
     let canEquip = reqAllowsClass(d, player.cls);
 
     // 2. 負重強化的擴充判定
-    if (!canEquip && loadUpAllows(item.id)) canEquip = true;
+    if (!canEquip && loadUpAllows(equipId)) canEquip = true;
     // 3. 🏅 劍術精通：妖精可裝備騎士限定的單手武器（非雙手、非弓）——⚠️ 遺物同樣適用（v3.7.83 起遺物也會走到這裡）
     if (!canEquip && hasMastery('e_sword') && d.type === 'wpn' && !d.w2h && !d.isBow && d.req && d.req.includes('knight')) canEquip = true;
     return canEquip;

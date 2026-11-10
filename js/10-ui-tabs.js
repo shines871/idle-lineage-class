@@ -154,6 +154,7 @@ function renderClassicSkillBook(sDiv) {
         + '</div>';
 }
 function renderTabs(force) {
+    if (typeof _deferItemTransactionEffect === 'function' && _deferItemTransactionEffect(renderTabs, arguments)) return;
     if(state.ff || (typeof catchupActive === 'function' && catchupActive())) return; // 補跑全部完成前不刷新畫面
     // 🚀 使用者正按住分頁面板(點擊中)：延後非強制重建到放開後，避免按鈕被重繪掉而點擊失效
     if(!force && (_tabPointerDown || _tabWheelActive)) { _tabRebuildPending = true; return; }
@@ -539,6 +540,7 @@ function wireBuffEnders() {
 }
 
 function renderSkillSelects() {
+    if (typeof _deferItemTransactionEffect === 'function' && _deferItemTransactionEffect(renderSkillSelects, arguments)) return;
     // 先記住目前選擇，重建後還原（避免穿脫裝備/學技能等呼叫時被重設為「無」）
     let prevAtk = document.getElementById('sel-atk-skill') ? document.getElementById('sel-atk-skill').value : '';
     let prevHeal = document.getElementById('sel-heal-skill') ? document.getElementById('sel-heal-skill').value : '';
@@ -713,7 +715,15 @@ const WEAPON_TAGS = {
     // 🌅 日出之國：巨釜＝雙手鈍器（重擊）、尾刃＝單手劍+武士刀（反擊+居合）、斷角＝矛（noBleed 停出血）；羽扇 isBow／黑尾 chainsword／扇子·怒火 isWand 旗標判定免 tag。
     relic_sr_kettle_maul:['雙手鈍器'], relic_sr_kama_blade:['單手劍','武士刀'], relic_sr_ushioni_horn:['矛']
 };
-function getWeaponTags(id){ return WEAPON_TAGS[id] || []; }
+function getWeaponTags(id){
+    let d = DB.items[id];
+    if (d && d.relicBaseId !== undefined) {
+        let baseId = d.relicBaseId, base = typeof baseId === 'string' && DB.items[baseId];
+        if (!base || base.relic || base.relicBaseId !== undefined || base.type !== 'wpn') return [];
+        id = baseId;
+    }
+    return WEAPON_TAGS[id] || [];
+}
 // ⚔️ 雙擊機率 comboRate：未明定者依武器標籤套預設（鋼爪 33% / 雙刀 25%）；個別武器可在 def 寫 comboRate 覆寫（底比斯歐西里斯雙刀30 / 死亡之指20 / 恨之鋼爪50 / 破壞雙刀·破壞鋼爪30）。日後新增 combo 武器自動取得預設機率。
 Object.keys(DB.items).forEach(function(id){ let d = DB.items[id]; if (d && d.eff === 'combo' && d.comboRate == null) { let tg = getWeaponTags(id); d.comboRate = tg.includes('鋼爪') ? 33 : (tg.includes('雙刀') ? 25 : 0); } });
 // 🗡️ 貫穿（ignHardSkin）批次標記（2026-06·用戶要求）：攻擊無視硬皮的額外物理減傷；一般＋經典皆生效（傷害公式旁路，非經典停用特效）。
@@ -731,6 +741,14 @@ Object.keys(DB.items).forEach(function(id){ let d = DB.items[id]; if (d && d.eff
      'wpn_18','wpn_16','wpn_halberd','wpn_12','wpn_crimson_spear'
     ].forEach(function(id){ if (DB.items[id]) DB.items[id].ignHardSkin = true; });   // 指定雙刀/具名劍/特定武器
     if (DB.items['wpn_death_finger']) delete DB.items['wpn_death_finger'].ignHardSkin;   // 鋼爪例外：死亡之指不加貫穿
+    // 原型的指定 ID 與例外已處理完，最後同步固定遺物變體，避免漏掉指定劍／矛或誤加死亡之指。
+    for (let id in DB.items) {
+        let d = DB.items[id], baseId = d && d.relicBaseId;
+        let base = typeof baseId === 'string' && DB.items[baseId];
+        if (!base || base.relic || base.relicBaseId !== undefined || base.type !== 'wpn') continue;
+        if (base.ignHardSkin) d.ignHardSkin = base.ignHardSkin;
+        else delete d.ignHardSkin;
+    }
     // 🔮 神官魔杖／惡魔王魔杖：兩版本都保留貫穿(ignHardSkin·無經典閘)＋魔爆(eff:magicburst·經典自動停用)。一般版＝貫穿+魔爆、經典版＝只剩貫穿(魔爆停用)
 })();
 // 🎮 經典模式：tooltip 不顯示已被停用的武器/盾牌特效字樣（共鳴/魔爆/連射/反擊/出血/穿透/切割/居合/魔擊/鈍擊/重擊/格檔）；連擊/月光爆裂/即死等未停用者照常顯示
@@ -837,6 +855,7 @@ function relicPurposeLabels(d) {
     if (d.iaiCrit) out.push('居合必定爆擊');
     if (d.procPoisonPct) out.push(`附毒（一般攻擊命中附加每秒該次傷害${d.procPoisonPct.pct || 50}%的中毒，最多1層，持續${d.procPoisonPct.dur || 6}秒）`);
     if (d.statusHealHp) out.push(`受到異常狀態影響時，恢復${d.statusHealHp}HP`);
+    if (d.dotMpRefund) out.push(`持續傷害回魔（因中毒、灼燒、燙傷或出血損失HP時，恢復損失量${d.dotMpRefund}%的MP）`);
     if (d.potionBonus && !d.doll) out.push(`治癒藥水恢復量+${d.potionBonus}%`);
     if (d.missGrazeRate) out.push(`擦傷補正（未命中時${d.missGrazeRate}%改判為擦傷，造成${d.grazeDmgPct || 50}%傷害且不會爆擊）`);
     if (d.hitEchoMagic) out.push(`元素爆破 ${d.hitEchoMagic.rate}%（命中後追加等同本次一般攻擊傷害的${eleName(d.hitEchoMagic.ele)}屬性魔法傷害）`);
@@ -1916,6 +1935,7 @@ function toggleInventoryAutoSort(on){ if(!player)return;player.inventoryAutoSort
 
 let _autoSortAt = -99999;
 function autoSortInventory() {
+    if (typeof _deferItemTransactionEffect === 'function' && _deferItemTransactionEffect(autoSortInventory, arguments)) return;
     if (!player || !Array.isArray(player.inv) || typeof state === 'undefined' || !state.running) return;   // 遊戲未開始（創角配發起始道具等）不排
     if (player.inventoryAutoSort === false) return;   // 整理開關獨立於自動販賣
     if (state.ticks - _autoSortAt < 100) return;   // ⏲️ 10 秒節流（100 ticks）
@@ -2214,7 +2234,8 @@ function sellItem(uid, count, unitPrice) {
     if(_wasGrant) { calcStats(); renderSkillSelects(); }   // 失去授予技能頭盔：立即更新
 }
 
-function closeModal() { document.getElementById('item-modal').classList.add('hidden'); }
+function closeModal() {
+    if (typeof _deferItemTransactionEffect === 'function' && _deferItemTransactionEffect(closeModal, arguments)) return; document.getElementById('item-modal').classList.add('hidden'); }
 function _pvpTabEsc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
